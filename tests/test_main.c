@@ -43,6 +43,58 @@ typedef struct test_material_user_s {
     test_cell_data_t ctor_value;
 } test_material_user_t;
 
+typedef struct test_runner_state_s {
+    uint32_t call_count;
+    uint32_t total_task_count;
+    uint32_t max_task_count;
+} test_runner_state_t;
+
+static rg_status_t test_runner_parallel_for(
+    void* runner_user,
+    uint32_t task_count,
+    rg_parallel_task_fn task,
+    void* task_user_data)
+{
+    test_runner_state_t* state;
+    uint32_t i;
+
+    if (task == NULL) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    state = (test_runner_state_t*)runner_user;
+    if (state != NULL) {
+        state->call_count += 1u;
+        state->total_task_count += task_count;
+        if (task_count > state->max_task_count) {
+            state->max_task_count = task_count;
+        }
+    }
+
+    /* Intentionally reverse order to validate deterministic conflict handling. */
+    for (i = task_count; i > 0u; --i) {
+        uint32_t task_index;
+        uint32_t worker_index;
+
+        task_index = i - 1u;
+        worker_index = task_index % 4u;
+        task(task_index, worker_index, task_user_data);
+    }
+
+    return RG_STATUS_OK;
+}
+
+static uint32_t test_runner_worker_count(void* runner_user)
+{
+    (void)runner_user;
+    return 4u;
+}
+
+static const rg_runner_vtable_t g_test_runner_vtable = {
+    test_runner_parallel_for,
+    test_runner_worker_count
+};
+
 static void test_ctor(void* dst, void* user_data)
 {
     test_material_user_t* user;
@@ -484,6 +536,114 @@ static int test_unloaded_chunk_cell_access(void)
     return 0;
 }
 
+static int test_checkerboard_parallel_cross_chunk_with_runner(void)
+{
+    rg_world_t* world;
+    rg_world_config_t cfg;
+    rg_material_id_t sand_id;
+    rg_cell_write_t write;
+    rg_cell_read_t read;
+    rg_step_options_t step_options;
+    rg_world_stats_t stats;
+    test_runner_state_t runner_state;
+    rg_runner_t runner;
+
+    memset(&runner_state, 0, sizeof(runner_state));
+    runner.vtable = &g_test_runner_vtable;
+    runner.user = &runner_state;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.chunk_width = 4;
+    cfg.chunk_height = 4;
+    cfg.default_step_mode = RG_STEP_MODE_CHUNK_CHECKERBOARD_PARALLEL;
+    cfg.deterministic_mode = 1u;
+    cfg.deterministic_seed = 7u;
+    cfg.runner = &runner;
+    ASSERT_STATUS(rg_world_create(&cfg, &world), RG_STATUS_OK);
+
+    ASSERT_TRUE(register_simple_material(world, "sand", RG_MATERIAL_POWDER, 10.0f, &sand_id) == 0);
+    ASSERT_STATUS(rg_chunk_load(world, 0, 0), RG_STATUS_OK);
+    ASSERT_STATUS(rg_chunk_load(world, 0, 1), RG_STATUS_OK);
+
+    memset(&write, 0, sizeof(write));
+    write.material_id = sand_id;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){1, 3}, &write), RG_STATUS_OK);
+
+    memset(&step_options, 0, sizeof(step_options));
+    step_options.mode = RG_STEP_MODE_CHUNK_CHECKERBOARD_PARALLEL;
+    step_options.substeps = 1u;
+    ASSERT_STATUS(rg_world_step(world, &step_options), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){1, 3}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == 0u);
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){1, 4}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == sand_id);
+
+    ASSERT_TRUE(runner_state.call_count > 0u);
+
+    ASSERT_STATUS(rg_world_get_stats(world, &stats), RG_STATUS_OK);
+    ASSERT_TRUE(stats.live_cells == 1u);
+    ASSERT_TRUE(stats.active_chunks == 1u);
+
+    rg_world_destroy(world);
+    return 0;
+}
+
+static int test_checkerboard_parallel_conflict_resolution(void)
+{
+    rg_world_t* world;
+    rg_world_config_t cfg;
+    rg_material_id_t water_id;
+    rg_cell_write_t write;
+    rg_cell_read_t read;
+    rg_step_options_t step_options;
+    rg_world_stats_t stats;
+    test_runner_state_t runner_state;
+    rg_runner_t runner;
+
+    memset(&runner_state, 0, sizeof(runner_state));
+    runner.vtable = &g_test_runner_vtable;
+    runner.user = &runner_state;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.chunk_width = 1;
+    cfg.chunk_height = 1;
+    cfg.default_step_mode = RG_STEP_MODE_CHUNK_CHECKERBOARD_PARALLEL;
+    cfg.deterministic_mode = 1u;
+    cfg.deterministic_seed = 100u;
+    cfg.runner = &runner;
+    ASSERT_STATUS(rg_world_create(&cfg, &world), RG_STATUS_OK);
+
+    ASSERT_TRUE(register_simple_material(world, "water", RG_MATERIAL_LIQUID, 5.0f, &water_id) == 0);
+    ASSERT_STATUS(rg_chunk_load(world, 0, 0), RG_STATUS_OK);
+    ASSERT_STATUS(rg_chunk_load(world, 1, 0), RG_STATUS_OK);
+    ASSERT_STATUS(rg_chunk_load(world, 2, 0), RG_STATUS_OK);
+
+    memset(&write, 0, sizeof(write));
+    write.material_id = water_id;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){0, 0}, &write), RG_STATUS_OK);
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){2, 0}, &write), RG_STATUS_OK);
+
+    memset(&step_options, 0, sizeof(step_options));
+    step_options.mode = RG_STEP_MODE_CHUNK_CHECKERBOARD_PARALLEL;
+    step_options.substeps = 1u;
+    ASSERT_STATUS(rg_world_step(world, &step_options), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){0, 0}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == 0u);
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){1, 0}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == water_id);
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){2, 0}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == water_id);
+
+    ASSERT_STATUS(rg_world_get_stats(world, &stats), RG_STATUS_OK);
+    ASSERT_TRUE(stats.intent_conflicts_last_step >= 1u);
+    ASSERT_TRUE(runner_state.call_count > 0u);
+
+    rg_world_destroy(world);
+    return 0;
+}
+
 int main(void)
 {
     RUN_TEST(test_world_create_defaults);
@@ -498,6 +658,8 @@ int main(void)
     RUN_TEST(test_cross_chunk_fall);
     RUN_TEST(test_chunk_scan_sleep_and_wake);
     RUN_TEST(test_unloaded_chunk_cell_access);
+    RUN_TEST(test_checkerboard_parallel_cross_chunk_with_runner);
+    RUN_TEST(test_checkerboard_parallel_conflict_resolution);
 
     printf("regolith tests passed\n");
     return 0;

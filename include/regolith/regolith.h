@@ -3,6 +3,7 @@
 
 #include "regolith/types.h"
 #include "regolith/world.h"
+#include "regolith/runner_sdl.h"
 
 #ifdef __cplusplus
 extern "C" {

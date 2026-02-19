@@ -77,6 +77,31 @@ struct rg_world_s {
     uint64_t payload_overflow_frees;
 };
 
+typedef struct rg_cross_intent_s {
+    uint32_t source_chunk_index;
+    uint32_t target_chunk_index;
+    uint32_t source_cell_index;
+    uint32_t target_cell_index;
+    rg_material_id_t source_material_id;
+    rg_material_id_t target_material_id;
+} rg_cross_intent_t;
+
+typedef struct rg_task_output_s {
+    rg_cross_intent_t* intents;
+    uint32_t intent_count;
+    uint32_t intent_capacity;
+    uint64_t emitted_move_count;
+    uint8_t changed;
+} rg_task_output_t;
+
+typedef struct rg_checkerboard_task_ctx_s {
+    rg_world_t* world;
+    uint64_t tick;
+    const uint32_t* chunk_indices;
+    uint32_t chunk_count;
+    rg_task_output_t* outputs;
+} rg_checkerboard_task_ctx_t;
+
 static int rg_is_power_of_two_u32(uint32_t value)
 {
     return value != 0u && (value & (value - 1u)) == 0u;
@@ -306,6 +331,28 @@ static void rg_chunk_set_awake(rg_world_t* world, rg_chunk_t* chunk, uint8_t awa
     } else if (world->active_chunk_count > 0u) {
         world->active_chunk_count -= 1u;
     }
+}
+
+static void rg_recompute_active_chunk_count(rg_world_t* world)
+{
+    uint32_t count;
+    uint32_t i;
+
+    if (world == NULL) {
+        return;
+    }
+
+    count = 0u;
+    for (i = 0u; i < world->chunk_count; ++i) {
+        rg_chunk_t* chunk;
+
+        chunk = world->chunks[i].chunk;
+        if (chunk != NULL && chunk->awake != 0u) {
+            count += 1u;
+        }
+    }
+
+    world->active_chunk_count = count;
 }
 
 static uint8_t rg_mask_test(const rg_chunk_t* chunk, uint32_t cell_index)
@@ -666,6 +713,7 @@ static rg_status_t rg_resolve_target(
     int32_t dx,
     int32_t dy,
     rg_chunk_entry_t** out_target_entry,
+    uint32_t* out_target_chunk_index,
     uint32_t* out_target_index,
     int32_t* out_target_local_x,
     int32_t* out_target_local_y)
@@ -679,6 +727,7 @@ static rg_status_t rg_resolve_target(
     if (world == NULL ||
         source_entry == NULL ||
         out_target_entry == NULL ||
+        out_target_chunk_index == NULL ||
         out_target_index == NULL ||
         out_target_local_x == NULL ||
         out_target_local_y == NULL) {
@@ -712,6 +761,7 @@ static rg_status_t rg_resolve_target(
     }
 
     *out_target_entry = &((rg_world_t*)world)->chunks[chunk_index];
+    *out_target_chunk_index = chunk_index;
     *out_target_local_x = target_local_x;
     *out_target_local_y = target_local_y;
     *out_target_index = ((uint32_t)target_local_y * (uint32_t)world->chunk_width) + (uint32_t)target_local_x;
@@ -741,6 +791,75 @@ static uint8_t rg_can_displace(
         return (uint8_t)(source_material->density != target_material->density);
     }
     return 0u;
+}
+
+static uint8_t rg_task_output_push_intent(rg_task_output_t* output, const rg_cross_intent_t* intent)
+{
+    rg_cross_intent_t* new_intents;
+    uint32_t new_capacity;
+
+    if (output == NULL || intent == NULL) {
+        return 0u;
+    }
+
+    if (output->intent_count >= output->intent_capacity) {
+        new_capacity = (output->intent_capacity == 0u) ? 16u : (output->intent_capacity * 2u);
+        new_intents = (rg_cross_intent_t*)realloc(output->intents, (size_t)new_capacity * sizeof(*new_intents));
+        if (new_intents == NULL) {
+            return 0u;
+        }
+        output->intents = new_intents;
+        output->intent_capacity = new_capacity;
+    }
+
+    output->intents[output->intent_count] = *intent;
+    output->intent_count += 1u;
+    return 1u;
+}
+
+static void rg_task_output_release(rg_task_output_t* output)
+{
+    if (output == NULL) {
+        return;
+    }
+
+    free(output->intents);
+    memset(output, 0, sizeof(*output));
+}
+
+static int rg_intent_compare_by_target(const void* lhs_void, const void* rhs_void)
+{
+    const rg_cross_intent_t* lhs;
+    const rg_cross_intent_t* rhs;
+
+    lhs = (const rg_cross_intent_t*)lhs_void;
+    rhs = (const rg_cross_intent_t*)rhs_void;
+
+    if (lhs->target_chunk_index < rhs->target_chunk_index) {
+        return -1;
+    }
+    if (lhs->target_chunk_index > rhs->target_chunk_index) {
+        return 1;
+    }
+    if (lhs->target_cell_index < rhs->target_cell_index) {
+        return -1;
+    }
+    if (lhs->target_cell_index > rhs->target_cell_index) {
+        return 1;
+    }
+    if (lhs->source_chunk_index < rhs->source_chunk_index) {
+        return -1;
+    }
+    if (lhs->source_chunk_index > rhs->source_chunk_index) {
+        return 1;
+    }
+    if (lhs->source_cell_index < rhs->source_cell_index) {
+        return -1;
+    }
+    if (lhs->source_cell_index > rhs->source_cell_index) {
+        return 1;
+    }
+    return 0;
 }
 
 static void rg_payload_swap(
@@ -802,8 +921,162 @@ static void rg_payload_move(
     memset(source_payload, 0, (size_t)world->inline_payload_bytes);
 }
 
+static uint8_t rg_apply_cross_intent(rg_world_t* world, const rg_cross_intent_t* intent)
+{
+    rg_chunk_entry_t* source_entry;
+    rg_chunk_entry_t* target_entry;
+    rg_chunk_t* source_chunk;
+    rg_chunk_t* target_chunk;
+    rg_material_id_t source_material_id;
+    rg_material_id_t target_material_id;
+    const rg_material_record_t* source_material;
+
+    if (world == NULL || intent == NULL) {
+        return 0u;
+    }
+    if (intent->source_chunk_index >= world->chunk_count ||
+        intent->target_chunk_index >= world->chunk_count ||
+        intent->source_cell_index >= world->cells_per_chunk ||
+        intent->target_cell_index >= world->cells_per_chunk) {
+        return 0u;
+    }
+
+    source_entry = &world->chunks[intent->source_chunk_index];
+    target_entry = &world->chunks[intent->target_chunk_index];
+    source_chunk = source_entry->chunk;
+    target_chunk = target_entry->chunk;
+    if (source_chunk == NULL || target_chunk == NULL) {
+        return 0u;
+    }
+
+    source_material_id = source_chunk->material_ids[intent->source_cell_index];
+    target_material_id = target_chunk->material_ids[intent->target_cell_index];
+    if (source_material_id != intent->source_material_id ||
+        target_material_id != intent->target_material_id) {
+        return 0u;
+    }
+
+    if (intent->target_material_id == 0u) {
+        source_material = rg_material_get(world, source_material_id);
+        if (source_material == NULL) {
+            return 0u;
+        }
+
+        target_chunk->material_ids[intent->target_cell_index] = source_material_id;
+        source_chunk->material_ids[intent->source_cell_index] = 0u;
+        rg_payload_move(
+            world,
+            source_chunk,
+            intent->source_cell_index,
+            target_chunk,
+            intent->target_cell_index,
+            source_material);
+
+        if (source_chunk != target_chunk) {
+            if (source_chunk->live_cells > 0u) {
+                source_chunk->live_cells -= 1u;
+            }
+            target_chunk->live_cells += 1u;
+        }
+    } else {
+        target_chunk->material_ids[intent->target_cell_index] = source_material_id;
+        source_chunk->material_ids[intent->source_cell_index] = intent->target_material_id;
+        rg_payload_swap(
+            world,
+            source_chunk,
+            intent->source_cell_index,
+            target_chunk,
+            intent->target_cell_index);
+    }
+
+    rg_mask_set(target_chunk, intent->target_cell_index);
+    source_chunk->idle_steps = 0u;
+    target_chunk->idle_steps = 0u;
+    source_chunk->awake = (uint8_t)(source_chunk->live_cells > 0u);
+    target_chunk->awake = (uint8_t)(target_chunk->live_cells > 0u);
+    return 1u;
+}
+
+static rg_status_t rg_merge_cross_intents(
+    rg_world_t* world,
+    rg_task_output_t* outputs,
+    uint32_t output_count)
+{
+    rg_cross_intent_t* merged;
+    uint32_t total_intents;
+    uint32_t write_cursor;
+    uint32_t i;
+
+    if (world == NULL) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+    if (outputs == NULL || output_count == 0u) {
+        return RG_STATUS_OK;
+    }
+
+    total_intents = 0u;
+    for (i = 0u; i < output_count; ++i) {
+        if (outputs[i].intent_count > UINT32_MAX - total_intents) {
+            return RG_STATUS_CAPACITY_REACHED;
+        }
+        total_intents += outputs[i].intent_count;
+    }
+
+    if (total_intents == 0u) {
+        return RG_STATUS_OK;
+    }
+
+    merged = (rg_cross_intent_t*)malloc((size_t)total_intents * sizeof(*merged));
+    if (merged == NULL) {
+        return RG_STATUS_ALLOCATION_FAILED;
+    }
+
+    write_cursor = 0u;
+    for (i = 0u; i < output_count; ++i) {
+        if (outputs[i].intent_count == 0u) {
+            continue;
+        }
+        memcpy(
+            &merged[write_cursor],
+            outputs[i].intents,
+            (size_t)outputs[i].intent_count * sizeof(*merged));
+        write_cursor += outputs[i].intent_count;
+    }
+
+    qsort(merged, (size_t)total_intents, sizeof(*merged), rg_intent_compare_by_target);
+
+    i = 0u;
+    while (i < total_intents) {
+        uint32_t j;
+        uint8_t applied;
+
+        j = i + 1u;
+        while (j < total_intents &&
+               merged[j].target_chunk_index == merged[i].target_chunk_index &&
+               merged[j].target_cell_index == merged[i].target_cell_index) {
+            j += 1u;
+        }
+
+        if (j > i + 1u) {
+            world->intent_conflicts_last_step += (uint64_t)(j - i - 1u);
+        }
+
+        applied = 0u;
+        while (i < j) {
+            if (applied == 0u && rg_apply_cross_intent(world, &merged[i]) != 0u) {
+                applied = 1u;
+            }
+            i += 1u;
+        }
+    }
+
+    free(merged);
+    return RG_STATUS_OK;
+}
+
 static uint8_t rg_attempt_move(
     rg_world_t* world,
+    uint32_t source_chunk_index,
     rg_chunk_entry_t* source_entry,
     int32_t source_local_x,
     int32_t source_local_y,
@@ -812,10 +1085,13 @@ static uint8_t rg_attempt_move(
     const rg_material_record_t* source_material,
     int32_t dx,
     int32_t dy,
-    uint8_t allow_lateral_displace)
+    uint8_t allow_lateral_displace,
+    uint8_t emit_cross_intents,
+    rg_task_output_t* task_output)
 {
     rg_status_t status;
     rg_chunk_entry_t* target_entry;
+    uint32_t target_chunk_index;
     int32_t target_local_x;
     int32_t target_local_y;
     uint32_t target_index;
@@ -836,6 +1112,7 @@ static uint8_t rg_attempt_move(
         dx,
         dy,
         &target_entry,
+        &target_chunk_index,
         &target_index,
         &target_local_x,
         &target_local_y);
@@ -859,10 +1136,50 @@ static uint8_t rg_attempt_move(
             return 0u;
         }
 
+        if (emit_cross_intents != 0u && target_chunk_index != source_chunk_index) {
+            rg_cross_intent_t intent;
+
+            if (task_output == NULL) {
+                return 0u;
+            }
+
+            intent.source_chunk_index = source_chunk_index;
+            intent.target_chunk_index = target_chunk_index;
+            intent.source_cell_index = source_index;
+            intent.target_cell_index = target_index;
+            intent.source_material_id = source_material_id;
+            intent.target_material_id = target_material_id;
+            if (rg_task_output_push_intent(task_output, &intent) == 0u) {
+                return 0u;
+            }
+            task_output->emitted_move_count += 1u;
+            return 1u;
+        }
+
         target_chunk->material_ids[target_index] = source_material_id;
         source_chunk->material_ids[source_index] = target_material_id;
         rg_payload_swap(world, source_chunk, source_index, target_chunk, target_index);
     } else {
+        if (emit_cross_intents != 0u && target_chunk_index != source_chunk_index) {
+            rg_cross_intent_t intent;
+
+            if (task_output == NULL) {
+                return 0u;
+            }
+
+            intent.source_chunk_index = source_chunk_index;
+            intent.target_chunk_index = target_chunk_index;
+            intent.source_cell_index = source_index;
+            intent.target_cell_index = target_index;
+            intent.source_material_id = source_material_id;
+            intent.target_material_id = 0u;
+            if (rg_task_output_push_intent(task_output, &intent) == 0u) {
+                return 0u;
+            }
+            task_output->emitted_move_count += 1u;
+            return 1u;
+        }
+
         target_chunk->material_ids[target_index] = source_material_id;
         source_chunk->material_ids[source_index] = 0u;
         rg_payload_move(world, source_chunk, source_index, target_chunk, target_index, source_material);
@@ -882,11 +1199,20 @@ static uint8_t rg_attempt_move(
 
     source_chunk->idle_steps = 0u;
     target_chunk->idle_steps = 0u;
-    rg_chunk_set_awake(world, source_chunk, (uint8_t)(source_chunk->live_cells > 0u));
-    rg_chunk_set_awake(world, target_chunk, (uint8_t)(target_chunk->live_cells > 0u));
+    if (task_output != NULL) {
+        source_chunk->awake = (uint8_t)(source_chunk->live_cells > 0u);
+        target_chunk->awake = (uint8_t)(target_chunk->live_cells > 0u);
+    } else {
+        rg_chunk_set_awake(world, source_chunk, (uint8_t)(source_chunk->live_cells > 0u));
+        rg_chunk_set_awake(world, target_chunk, (uint8_t)(target_chunk->live_cells > 0u));
+    }
     rg_mask_set(target_chunk, target_index);
 
-    world->intents_emitted_last_step += 1u;
+    if (task_output != NULL) {
+        task_output->emitted_move_count += 1u;
+    } else {
+        world->intents_emitted_last_step += 1u;
+    }
     (void)target_local_x;
     (void)target_local_y;
     return 1u;
@@ -894,13 +1220,16 @@ static uint8_t rg_attempt_move(
 
 static uint8_t rg_step_powder(
     rg_world_t* world,
+    uint32_t source_chunk_index,
     rg_chunk_entry_t* source_entry,
     int32_t source_local_x,
     int32_t source_local_y,
     uint32_t source_index,
     rg_material_id_t source_material_id,
     const rg_material_record_t* source_material,
-    uint8_t primary_left)
+    uint8_t primary_left,
+    uint8_t emit_cross_intents,
+    rg_task_output_t* task_output)
 {
     int32_t first_dx;
     int32_t second_dx;
@@ -910,6 +1239,7 @@ static uint8_t rg_step_powder(
 
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -918,11 +1248,14 @@ static uint8_t rg_step_powder(
             source_material,
             0,
             1,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -931,11 +1264,14 @@ static uint8_t rg_step_powder(
             source_material,
             first_dx,
             1,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -944,7 +1280,9 @@ static uint8_t rg_step_powder(
             source_material,
             second_dx,
             1,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
 
@@ -953,13 +1291,16 @@ static uint8_t rg_step_powder(
 
 static uint8_t rg_step_liquid(
     rg_world_t* world,
+    uint32_t source_chunk_index,
     rg_chunk_entry_t* source_entry,
     int32_t source_local_x,
     int32_t source_local_y,
     uint32_t source_index,
     rg_material_id_t source_material_id,
     const rg_material_record_t* source_material,
-    uint8_t primary_left)
+    uint8_t primary_left,
+    uint8_t emit_cross_intents,
+    rg_task_output_t* task_output)
 {
     int32_t first_dx;
     int32_t second_dx;
@@ -969,6 +1310,7 @@ static uint8_t rg_step_liquid(
 
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -977,11 +1319,14 @@ static uint8_t rg_step_liquid(
             source_material,
             0,
             1,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -990,11 +1335,14 @@ static uint8_t rg_step_liquid(
             source_material,
             first_dx,
             0,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -1003,11 +1351,14 @@ static uint8_t rg_step_liquid(
             source_material,
             second_dx,
             0,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -1016,11 +1367,14 @@ static uint8_t rg_step_liquid(
             source_material,
             first_dx,
             1,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -1029,7 +1383,9 @@ static uint8_t rg_step_liquid(
             source_material,
             second_dx,
             1,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
 
@@ -1038,13 +1394,16 @@ static uint8_t rg_step_liquid(
 
 static uint8_t rg_step_gas(
     rg_world_t* world,
+    uint32_t source_chunk_index,
     rg_chunk_entry_t* source_entry,
     int32_t source_local_x,
     int32_t source_local_y,
     uint32_t source_index,
     rg_material_id_t source_material_id,
     const rg_material_record_t* source_material,
-    uint8_t primary_left)
+    uint8_t primary_left,
+    uint8_t emit_cross_intents,
+    rg_task_output_t* task_output)
 {
     int32_t first_dx;
     int32_t second_dx;
@@ -1054,6 +1413,7 @@ static uint8_t rg_step_gas(
 
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -1062,11 +1422,14 @@ static uint8_t rg_step_gas(
             source_material,
             0,
             -1,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -1075,11 +1438,14 @@ static uint8_t rg_step_gas(
             source_material,
             first_dx,
             0,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -1088,11 +1454,14 @@ static uint8_t rg_step_gas(
             source_material,
             second_dx,
             0,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -1101,11 +1470,14 @@ static uint8_t rg_step_gas(
             source_material,
             first_dx,
             -1,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
     if (rg_attempt_move(
             world,
+            source_chunk_index,
             source_entry,
             source_local_x,
             source_local_y,
@@ -1114,20 +1486,33 @@ static uint8_t rg_step_gas(
             source_material,
             second_dx,
             -1,
-            0u) != 0u) {
+            0u,
+            emit_cross_intents,
+            task_output) != 0u) {
         return 1u;
     }
 
     return 0u;
 }
 
-static uint8_t rg_step_chunk_serial(rg_world_t* world, rg_chunk_entry_t* entry, uint64_t tick)
+static uint8_t rg_step_chunk_serial(
+    rg_world_t* world,
+    uint32_t source_chunk_index,
+    uint64_t tick,
+    uint8_t emit_cross_intents,
+    rg_task_output_t* task_output)
 {
+    rg_chunk_entry_t* entry;
     rg_chunk_t* chunk;
     int32_t y;
     uint8_t changed;
 
-    if (world == NULL || entry == NULL || entry->chunk == NULL) {
+    if (world == NULL || source_chunk_index >= world->chunk_count) {
+        return 0u;
+    }
+
+    entry = &world->chunks[source_chunk_index];
+    if (entry->chunk == NULL) {
         return 0u;
     }
 
@@ -1179,33 +1564,42 @@ static uint8_t rg_step_chunk_serial(rg_world_t* world, rg_chunk_entry_t* entry, 
             if ((material->flags & RG_MATERIAL_GAS) != 0u) {
                 moved = rg_step_gas(
                     world,
+                    source_chunk_index,
                     entry,
                     x,
                     y,
                     index,
                     material_id,
                     material,
-                    primary_left);
+                    primary_left,
+                    emit_cross_intents,
+                    task_output);
             } else if ((material->flags & RG_MATERIAL_LIQUID) != 0u) {
                 moved = rg_step_liquid(
                     world,
+                    source_chunk_index,
                     entry,
                     x,
                     y,
                     index,
                     material_id,
                     material,
-                    primary_left);
+                    primary_left,
+                    emit_cross_intents,
+                    task_output);
             } else if ((material->flags & RG_MATERIAL_POWDER) != 0u) {
                 moved = rg_step_powder(
                     world,
+                    source_chunk_index,
                     entry,
                     x,
                     y,
                     index,
                     material_id,
                     material,
-                    primary_left);
+                    primary_left,
+                    emit_cross_intents,
+                    task_output);
             }
 
             if (moved != 0u) {
@@ -1214,21 +1608,40 @@ static uint8_t rg_step_chunk_serial(rg_world_t* world, rg_chunk_entry_t* entry, 
         }
     }
 
+    if (emit_cross_intents != 0u && task_output != NULL && task_output->intent_count > 0u) {
+        changed = 1u;
+    }
+
     if (chunk->live_cells == 0u) {
         chunk->idle_steps = 0u;
-        rg_chunk_set_awake(world, chunk, 0u);
+        if (task_output != NULL) {
+            chunk->awake = 0u;
+        } else {
+            rg_chunk_set_awake(world, chunk, 0u);
+        }
     } else if (changed != 0u) {
         chunk->idle_steps = 0u;
-        rg_chunk_set_awake(world, chunk, 1u);
+        if (task_output != NULL) {
+            chunk->awake = 1u;
+        } else {
+            rg_chunk_set_awake(world, chunk, 1u);
+        }
     } else {
         if (chunk->idle_steps < UINT32_MAX) {
             chunk->idle_steps += 1u;
         }
         if (chunk->idle_steps >= RG_CHUNK_SLEEP_TICKS) {
-            rg_chunk_set_awake(world, chunk, 0u);
+            if (task_output != NULL) {
+                chunk->awake = 0u;
+            } else {
+                rg_chunk_set_awake(world, chunk, 0u);
+            }
         }
     }
 
+    if (task_output != NULL) {
+        task_output->changed = changed;
+    }
     return changed;
 }
 
@@ -1243,7 +1656,7 @@ static rg_status_t rg_step_full_scan_serial(rg_world_t* world, uint64_t tick)
     rg_prepare_step_masks(world);
 
     for (i = 0u; i < world->chunk_count; ++i) {
-        (void)rg_step_chunk_serial(world, &world->chunks[i], tick);
+        (void)rg_step_chunk_serial(world, i, tick, 0u, NULL);
     }
 
     return RG_STATUS_OK;
@@ -1266,7 +1679,160 @@ static rg_status_t rg_step_chunk_scan_serial(rg_world_t* world, uint64_t tick)
         if (chunk == NULL || chunk->awake == 0u) {
             continue;
         }
-        (void)rg_step_chunk_serial(world, &world->chunks[i], tick);
+        (void)rg_step_chunk_serial(world, i, tick, 0u, NULL);
+    }
+
+    return RG_STATUS_OK;
+}
+
+static uint8_t rg_has_parallel_runner(const rg_world_t* world)
+{
+    if (world == NULL || world->runner == NULL || world->runner->vtable == NULL) {
+        return 0u;
+    }
+    return (uint8_t)(world->runner->vtable->parallel_for != NULL);
+}
+
+static void rg_checkerboard_task_callback(uint32_t task_index, uint32_t worker_index, void* user_data)
+{
+    rg_checkerboard_task_ctx_t* ctx;
+
+    (void)worker_index;
+
+    ctx = (rg_checkerboard_task_ctx_t*)user_data;
+    if (ctx == NULL || task_index >= ctx->chunk_count || ctx->outputs == NULL) {
+        return;
+    }
+
+    (void)rg_step_chunk_serial(
+        ctx->world,
+        ctx->chunk_indices[task_index],
+        ctx->tick,
+        1u,
+        &ctx->outputs[task_index]);
+}
+
+static rg_status_t rg_execute_checkerboard_phase(
+    rg_world_t* world,
+    uint64_t tick,
+    uint32_t color_x,
+    uint32_t color_y)
+{
+    uint32_t* chunk_indices;
+    rg_task_output_t* outputs;
+    rg_checkerboard_task_ctx_t task_ctx;
+    uint32_t task_count;
+    uint32_t i;
+    rg_status_t status;
+
+    if (world == NULL) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    chunk_indices = NULL;
+    outputs = NULL;
+    task_count = 0u;
+    status = RG_STATUS_OK;
+
+    if (world->chunk_count > 0u) {
+        chunk_indices = (uint32_t*)malloc((size_t)world->chunk_count * sizeof(*chunk_indices));
+        if (chunk_indices == NULL) {
+            return RG_STATUS_ALLOCATION_FAILED;
+        }
+    }
+
+    for (i = 0u; i < world->chunk_count; ++i) {
+        rg_chunk_entry_t* entry;
+        rg_chunk_t* chunk;
+        uint32_t x_parity;
+        uint32_t y_parity;
+
+        entry = &world->chunks[i];
+        chunk = entry->chunk;
+        if (chunk == NULL || chunk->live_cells == 0u || chunk->awake == 0u) {
+            continue;
+        }
+
+        x_parity = ((uint32_t)entry->chunk_x) & 1u;
+        y_parity = ((uint32_t)entry->chunk_y) & 1u;
+        if (x_parity != color_x || y_parity != color_y) {
+            continue;
+        }
+
+        chunk_indices[task_count] = i;
+        task_count += 1u;
+    }
+
+    if (task_count == 0u) {
+        free(chunk_indices);
+        return RG_STATUS_OK;
+    }
+
+    outputs = (rg_task_output_t*)calloc((size_t)task_count, sizeof(*outputs));
+    if (outputs == NULL) {
+        free(chunk_indices);
+        return RG_STATUS_ALLOCATION_FAILED;
+    }
+
+    memset(&task_ctx, 0, sizeof(task_ctx));
+    task_ctx.world = world;
+    task_ctx.tick = tick;
+    task_ctx.chunk_indices = chunk_indices;
+    task_ctx.chunk_count = task_count;
+    task_ctx.outputs = outputs;
+
+    if (rg_has_parallel_runner(world) != 0u) {
+        status = world->runner->vtable->parallel_for(
+            world->runner->user,
+            task_count,
+            rg_checkerboard_task_callback,
+            &task_ctx);
+    } else {
+        for (i = 0u; i < task_count; ++i) {
+            rg_checkerboard_task_callback(i, 0u, &task_ctx);
+        }
+    }
+
+    if (status == RG_STATUS_OK) {
+        for (i = 0u; i < task_count; ++i) {
+            world->intents_emitted_last_step += outputs[i].emitted_move_count;
+        }
+        status = rg_merge_cross_intents(world, outputs, task_count);
+        rg_recompute_active_chunk_count(world);
+    } else {
+        rg_recompute_active_chunk_count(world);
+    }
+
+    for (i = 0u; i < task_count; ++i) {
+        rg_task_output_release(&outputs[i]);
+    }
+    free(outputs);
+    free(chunk_indices);
+    return status;
+}
+
+static rg_status_t rg_step_checkerboard_parallel(rg_world_t* world, uint64_t tick)
+{
+    uint32_t color_index;
+    rg_status_t status;
+
+    if (world == NULL) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    rg_prepare_step_masks(world);
+
+    for (color_index = 0u; color_index < 4u; ++color_index) {
+        uint32_t color_x;
+        uint32_t color_y;
+
+        color_x = color_index & 1u;
+        color_y = (color_index >> 1u) & 1u;
+
+        status = rg_execute_checkerboard_phase(world, tick, color_x, color_y);
+        if (status != RG_STATUS_OK) {
+            return status;
+        }
     }
 
     return RG_STATUS_OK;
@@ -1708,8 +2274,7 @@ rg_status_t rg_world_step(rg_world_t* world, const rg_step_options_t* options)
             status = rg_step_chunk_scan_serial(world, tick);
             break;
         case RG_STEP_MODE_CHUNK_CHECKERBOARD_PARALLEL:
-            /* Temporary behavior until checkerboard backend is implemented. */
-            status = rg_step_chunk_scan_serial(world, tick);
+            status = rg_step_checkerboard_parallel(world, tick);
             break;
         default:
             status = RG_STATUS_INVALID_ARGUMENT;
