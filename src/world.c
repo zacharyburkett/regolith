@@ -12,7 +12,8 @@ enum {
     RG_DEFAULT_CHUNK_HEIGHT = 64,
     RG_DEFAULT_INLINE_PAYLOAD_BYTES = 16,
     RG_DEFAULT_MAX_MATERIALS = 256,
-    RG_DEFAULT_INITIAL_CHUNKS = 16
+    RG_DEFAULT_INITIAL_CHUNKS = 16,
+    RG_CHUNK_SLEEP_TICKS = 8
 };
 
 typedef struct rg_material_record_s {
@@ -34,7 +35,10 @@ typedef struct rg_material_record_s {
 typedef struct rg_chunk_s {
     uint16_t* material_ids;
     uint8_t* inline_payload;
+    uint8_t* updated_mask;
     uint32_t live_cells;
+    uint32_t idle_steps;
+    uint8_t awake;
 } rg_chunk_t;
 
 typedef struct rg_chunk_entry_s {
@@ -55,6 +59,7 @@ struct rg_world_s {
     uint32_t cells_per_chunk;
     uint16_t inline_payload_bytes;
     uint16_t max_materials;
+    uint8_t* swap_payload;
 
     rg_material_record_t* materials;
     rg_material_id_t material_count;
@@ -75,6 +80,16 @@ struct rg_world_s {
 static int rg_is_power_of_two_u32(uint32_t value)
 {
     return value != 0u && (value & (value - 1u)) == 0u;
+}
+
+static uint64_t rg_mix_u64(uint64_t value)
+{
+    value ^= value >> 30u;
+    value *= 0xbf58476d1ce4e5b9ull;
+    value ^= value >> 27u;
+    value *= 0x94d049bb133111ebull;
+    value ^= value >> 31u;
+    return value;
 }
 
 static void* rg_default_alloc(void* user, size_t size, size_t align)
@@ -176,6 +191,7 @@ static char* rg_strdup_with_allocator(rg_allocator_t* allocator, const char* tex
     if (copy == NULL) {
         return NULL;
     }
+
     memcpy(copy, text, len + 1u);
     return copy;
 }
@@ -199,6 +215,17 @@ static void rg_split_coord(
     if (out_chunk_coord != NULL) {
         *out_chunk_coord = (value - local) / chunk_extent;
     }
+}
+
+static uint8_t rg_chunk_coord_less(int32_t ax, int32_t ay, int32_t bx, int32_t by)
+{
+    if (ay < by) {
+        return 1u;
+    }
+    if (ay > by) {
+        return 0u;
+    }
+    return (uint8_t)(ax < bx);
 }
 
 static uint32_t rg_chunk_find_index(const rg_world_t* world, int32_t chunk_x, int32_t chunk_y)
@@ -250,6 +277,7 @@ static rg_status_t rg_chunk_reserve(rg_world_t* world, uint32_t min_capacity)
     if (world->chunk_count > 0u) {
         memcpy(new_entries, world->chunks, (size_t)world->chunk_count * sizeof(*new_entries));
     }
+
     rg_free_bytes(
         &world->allocator,
         world->chunks,
@@ -259,6 +287,78 @@ static rg_status_t rg_chunk_reserve(rg_world_t* world, uint32_t min_capacity)
     world->chunks = new_entries;
     world->chunk_capacity = new_capacity;
     return RG_STATUS_OK;
+}
+
+static void rg_chunk_set_awake(rg_world_t* world, rg_chunk_t* chunk, uint8_t awake)
+{
+    if (world == NULL || chunk == NULL) {
+        return;
+    }
+
+    awake = (uint8_t)(awake != 0u);
+    if (chunk->awake == awake) {
+        return;
+    }
+
+    chunk->awake = awake;
+    if (awake != 0u) {
+        world->active_chunk_count += 1u;
+    } else if (world->active_chunk_count > 0u) {
+        world->active_chunk_count -= 1u;
+    }
+}
+
+static uint8_t rg_mask_test(const rg_chunk_t* chunk, uint32_t cell_index)
+{
+    uint32_t byte_index;
+    uint32_t bit_index;
+
+    if (chunk == NULL || chunk->updated_mask == NULL) {
+        return 0u;
+    }
+
+    byte_index = cell_index >> 3u;
+    bit_index = cell_index & 7u;
+    return (uint8_t)((chunk->updated_mask[byte_index] >> bit_index) & 1u);
+}
+
+static void rg_mask_set(rg_chunk_t* chunk, uint32_t cell_index)
+{
+    uint32_t byte_index;
+    uint32_t bit_index;
+
+    if (chunk == NULL || chunk->updated_mask == NULL) {
+        return;
+    }
+
+    byte_index = cell_index >> 3u;
+    bit_index = cell_index & 7u;
+    chunk->updated_mask[byte_index] = (uint8_t)(chunk->updated_mask[byte_index] | (uint8_t)(1u << bit_index));
+}
+
+static void rg_mask_clear_all(rg_world_t* world, rg_chunk_t* chunk)
+{
+    size_t mask_bytes;
+
+    if (world == NULL || chunk == NULL || chunk->updated_mask == NULL) {
+        return;
+    }
+
+    mask_bytes = ((size_t)world->cells_per_chunk + 7u) / 8u;
+    memset(chunk->updated_mask, 0, mask_bytes);
+}
+
+static void rg_prepare_step_masks(rg_world_t* world)
+{
+    uint32_t i;
+
+    if (world == NULL) {
+        return;
+    }
+
+    for (i = 0u; i < world->chunk_count; ++i) {
+        rg_mask_clear_all(world, world->chunks[i].chunk);
+    }
 }
 
 static const rg_material_record_t* rg_material_get(
@@ -354,16 +454,15 @@ static void rg_update_live_counts(
     rg_material_id_t old_material,
     rg_material_id_t new_material)
 {
-    if (world == NULL || chunk == NULL || old_material == new_material) {
+    if (world == NULL || chunk == NULL) {
         return;
     }
 
     if (old_material == 0u && new_material != 0u) {
         world->live_cells += 1u;
         chunk->live_cells += 1u;
-        if (chunk->live_cells == 1u) {
-            world->active_chunk_count += 1u;
-        }
+        chunk->idle_steps = 0u;
+        rg_chunk_set_awake(world, chunk, 1u);
         return;
     }
 
@@ -373,10 +472,20 @@ static void rg_update_live_counts(
         }
         if (chunk->live_cells > 0u) {
             chunk->live_cells -= 1u;
-            if (chunk->live_cells == 0u && world->active_chunk_count > 0u) {
-                world->active_chunk_count -= 1u;
-            }
         }
+
+        chunk->idle_steps = 0u;
+        if (chunk->live_cells == 0u) {
+            rg_chunk_set_awake(world, chunk, 0u);
+        } else {
+            rg_chunk_set_awake(world, chunk, 1u);
+        }
+        return;
+    }
+
+    if (old_material != 0u && new_material != 0u) {
+        chunk->idle_steps = 0u;
+        rg_chunk_set_awake(world, chunk, 1u);
     }
 }
 
@@ -414,6 +523,7 @@ static rg_status_t rg_chunk_create(rg_world_t* world, rg_chunk_t** out_chunk)
     rg_chunk_t* chunk;
     size_t material_bytes;
     size_t payload_bytes;
+    size_t mask_bytes;
 
     if (world == NULL || out_chunk == NULL) {
         return RG_STATUS_INVALID_ARGUMENT;
@@ -449,6 +559,19 @@ static rg_status_t rg_chunk_create(rg_world_t* world, rg_chunk_t** out_chunk)
         memset(chunk->inline_payload, 0, payload_bytes);
     }
 
+    mask_bytes = ((size_t)world->cells_per_chunk + 7u) / 8u;
+    chunk->updated_mask = (uint8_t*)rg_alloc_bytes(&world->allocator, mask_bytes, 1u);
+    if (chunk->updated_mask == NULL) {
+        rg_free_bytes(&world->allocator, chunk->inline_payload, payload_bytes, 1u);
+        rg_free_bytes(&world->allocator, chunk->material_ids, material_bytes, _Alignof(uint16_t));
+        rg_free_bytes(&world->allocator, chunk, sizeof(*chunk), _Alignof(rg_chunk_t));
+        return RG_STATUS_ALLOCATION_FAILED;
+    }
+    memset(chunk->updated_mask, 0, mask_bytes);
+    chunk->live_cells = 0u;
+    chunk->idle_steps = 0u;
+    chunk->awake = 0u;
+
     *out_chunk = chunk;
     return RG_STATUS_OK;
 }
@@ -457,6 +580,7 @@ static void rg_chunk_destroy(rg_world_t* world, rg_chunk_t* chunk)
 {
     size_t material_bytes;
     size_t payload_bytes;
+    size_t mask_bytes;
     uint32_t i;
 
     if (world == NULL || chunk == NULL) {
@@ -480,10 +604,672 @@ static void rg_chunk_destroy(rg_world_t* world, rg_chunk_t* chunk)
 
     material_bytes = (size_t)world->cells_per_chunk * sizeof(*chunk->material_ids);
     payload_bytes = (size_t)world->cells_per_chunk * (size_t)world->inline_payload_bytes;
+    mask_bytes = ((size_t)world->cells_per_chunk + 7u) / 8u;
 
+    rg_free_bytes(&world->allocator, chunk->updated_mask, mask_bytes, 1u);
     rg_free_bytes(&world->allocator, chunk->inline_payload, payload_bytes, 1u);
     rg_free_bytes(&world->allocator, chunk->material_ids, material_bytes, _Alignof(uint16_t));
     rg_free_bytes(&world->allocator, chunk, sizeof(*chunk), _Alignof(rg_chunk_t));
+}
+
+static uint32_t rg_chunk_insert_index(const rg_world_t* world, int32_t chunk_x, int32_t chunk_y)
+{
+    uint32_t i;
+
+    if (world == NULL) {
+        return 0u;
+    }
+
+    for (i = 0u; i < world->chunk_count; ++i) {
+        if (rg_chunk_coord_less(chunk_x, chunk_y, world->chunks[i].chunk_x, world->chunks[i].chunk_y) != 0u) {
+            return i;
+        }
+    }
+    return world->chunk_count;
+}
+
+static uint32_t rg_step_random(
+    const rg_world_t* world,
+    uint64_t tick,
+    int32_t chunk_x,
+    int32_t chunk_y,
+    int32_t local_x,
+    int32_t local_y,
+    uint32_t salt)
+{
+    uint64_t seed;
+    uint64_t key;
+
+    if (world == NULL) {
+        return 0u;
+    }
+
+    seed = world->deterministic_seed;
+    if (world->deterministic_mode == 0u) {
+        seed ^= (uint64_t)(uintptr_t)world;
+    }
+
+    key = seed;
+    key ^= tick * 0x9e3779b97f4a7c15ull;
+    key ^= ((uint64_t)(uint32_t)chunk_x << 32u) ^ (uint64_t)(uint32_t)chunk_y;
+    key ^= ((uint64_t)(uint32_t)local_x << 32u) ^ (uint64_t)(uint32_t)local_y;
+    key ^= (uint64_t)salt * 0xd6e8feb86659fd93ull;
+
+    return (uint32_t)rg_mix_u64(key);
+}
+
+static rg_status_t rg_resolve_target(
+    const rg_world_t* world,
+    const rg_chunk_entry_t* source_entry,
+    int32_t source_local_x,
+    int32_t source_local_y,
+    int32_t dx,
+    int32_t dy,
+    rg_chunk_entry_t** out_target_entry,
+    uint32_t* out_target_index,
+    int32_t* out_target_local_x,
+    int32_t* out_target_local_y)
+{
+    int32_t target_chunk_x;
+    int32_t target_chunk_y;
+    int32_t target_local_x;
+    int32_t target_local_y;
+    uint32_t chunk_index;
+
+    if (world == NULL ||
+        source_entry == NULL ||
+        out_target_entry == NULL ||
+        out_target_index == NULL ||
+        out_target_local_x == NULL ||
+        out_target_local_y == NULL) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    target_chunk_x = source_entry->chunk_x;
+    target_chunk_y = source_entry->chunk_y;
+    target_local_x = source_local_x + dx;
+    target_local_y = source_local_y + dy;
+
+    if (target_local_x < 0) {
+        target_chunk_x -= 1;
+        target_local_x += world->chunk_width;
+    } else if (target_local_x >= world->chunk_width) {
+        target_chunk_x += 1;
+        target_local_x -= world->chunk_width;
+    }
+
+    if (target_local_y < 0) {
+        target_chunk_y -= 1;
+        target_local_y += world->chunk_height;
+    } else if (target_local_y >= world->chunk_height) {
+        target_chunk_y += 1;
+        target_local_y -= world->chunk_height;
+    }
+
+    chunk_index = rg_chunk_find_index(world, target_chunk_x, target_chunk_y);
+    if (chunk_index == UINT32_MAX) {
+        return RG_STATUS_NOT_FOUND;
+    }
+
+    *out_target_entry = &((rg_world_t*)world)->chunks[chunk_index];
+    *out_target_local_x = target_local_x;
+    *out_target_local_y = target_local_y;
+    *out_target_index = ((uint32_t)target_local_y * (uint32_t)world->chunk_width) + (uint32_t)target_local_x;
+    return RG_STATUS_OK;
+}
+
+static uint8_t rg_can_displace(
+    const rg_material_record_t* source_material,
+    const rg_material_record_t* target_material,
+    int32_t dy,
+    uint8_t allow_lateral_displace)
+{
+    if (source_material == NULL || target_material == NULL) {
+        return 0u;
+    }
+    if ((target_material->flags & RG_MATERIAL_STATIC) != 0u) {
+        return 0u;
+    }
+
+    if (dy > 0) {
+        return (uint8_t)(source_material->density > target_material->density);
+    }
+    if (dy < 0) {
+        return (uint8_t)(source_material->density < target_material->density);
+    }
+    if (allow_lateral_displace != 0u) {
+        return (uint8_t)(source_material->density != target_material->density);
+    }
+    return 0u;
+}
+
+static void rg_payload_swap(
+    rg_world_t* world,
+    rg_chunk_t* chunk_a,
+    uint32_t index_a,
+    rg_chunk_t* chunk_b,
+    uint32_t index_b)
+{
+    void* payload_a;
+    void* payload_b;
+
+    if (world == NULL ||
+        world->inline_payload_bytes == 0u ||
+        world->swap_payload == NULL ||
+        chunk_a == NULL ||
+        chunk_b == NULL) {
+        return;
+    }
+
+    payload_a = rg_chunk_payload_ptr(world, chunk_a, index_a);
+    payload_b = rg_chunk_payload_ptr(world, chunk_b, index_b);
+    if (payload_a == NULL || payload_b == NULL) {
+        return;
+    }
+
+    memmove(world->swap_payload, payload_a, (size_t)world->inline_payload_bytes);
+    memmove(payload_a, payload_b, (size_t)world->inline_payload_bytes);
+    memmove(payload_b, world->swap_payload, (size_t)world->inline_payload_bytes);
+}
+
+static void rg_payload_move(
+    rg_world_t* world,
+    rg_chunk_t* source_chunk,
+    uint32_t source_index,
+    rg_chunk_t* target_chunk,
+    uint32_t target_index,
+    const rg_material_record_t* material)
+{
+    void* source_payload;
+    void* target_payload;
+
+    if (world == NULL || material == NULL || material->instance_size == 0u) {
+        return;
+    }
+
+    source_payload = rg_chunk_payload_ptr(world, source_chunk, source_index);
+    target_payload = rg_chunk_payload_ptr(world, target_chunk, target_index);
+    if (source_payload == NULL || target_payload == NULL) {
+        return;
+    }
+
+    memset(target_payload, 0, (size_t)world->inline_payload_bytes);
+    if (material->instance_move != NULL) {
+        material->instance_move(target_payload, source_payload, material->user_data);
+    } else {
+        memmove(target_payload, source_payload, material->instance_size);
+    }
+    memset(source_payload, 0, (size_t)world->inline_payload_bytes);
+}
+
+static uint8_t rg_attempt_move(
+    rg_world_t* world,
+    rg_chunk_entry_t* source_entry,
+    int32_t source_local_x,
+    int32_t source_local_y,
+    uint32_t source_index,
+    rg_material_id_t source_material_id,
+    const rg_material_record_t* source_material,
+    int32_t dx,
+    int32_t dy,
+    uint8_t allow_lateral_displace)
+{
+    rg_status_t status;
+    rg_chunk_entry_t* target_entry;
+    int32_t target_local_x;
+    int32_t target_local_y;
+    uint32_t target_index;
+    rg_chunk_t* source_chunk;
+    rg_chunk_t* target_chunk;
+    rg_material_id_t target_material_id;
+    const rg_material_record_t* target_material;
+
+    if (world == NULL || source_entry == NULL || source_material == NULL || source_material_id == 0u) {
+        return 0u;
+    }
+
+    status = rg_resolve_target(
+        world,
+        source_entry,
+        source_local_x,
+        source_local_y,
+        dx,
+        dy,
+        &target_entry,
+        &target_index,
+        &target_local_x,
+        &target_local_y);
+    if (status != RG_STATUS_OK) {
+        return 0u;
+    }
+
+    source_chunk = source_entry->chunk;
+    target_chunk = target_entry->chunk;
+    if (source_chunk == NULL || target_chunk == NULL) {
+        return 0u;
+    }
+
+    target_material_id = target_chunk->material_ids[target_index];
+    if (target_material_id != 0u) {
+        target_material = rg_material_get(world, target_material_id);
+        if (target_material == NULL) {
+            return 0u;
+        }
+        if (rg_can_displace(source_material, target_material, dy, allow_lateral_displace) == 0u) {
+            return 0u;
+        }
+
+        target_chunk->material_ids[target_index] = source_material_id;
+        source_chunk->material_ids[source_index] = target_material_id;
+        rg_payload_swap(world, source_chunk, source_index, target_chunk, target_index);
+    } else {
+        target_chunk->material_ids[target_index] = source_material_id;
+        source_chunk->material_ids[source_index] = 0u;
+        rg_payload_move(world, source_chunk, source_index, target_chunk, target_index, source_material);
+
+        if (source_chunk != target_chunk) {
+            if (source_chunk->live_cells > 0u) {
+                source_chunk->live_cells -= 1u;
+            }
+            target_chunk->live_cells += 1u;
+
+            if (source_chunk->live_cells == 0u) {
+                source_chunk->idle_steps = 0u;
+                rg_chunk_set_awake(world, source_chunk, 0u);
+            }
+        }
+    }
+
+    source_chunk->idle_steps = 0u;
+    target_chunk->idle_steps = 0u;
+    rg_chunk_set_awake(world, source_chunk, (uint8_t)(source_chunk->live_cells > 0u));
+    rg_chunk_set_awake(world, target_chunk, (uint8_t)(target_chunk->live_cells > 0u));
+    rg_mask_set(target_chunk, target_index);
+
+    world->intents_emitted_last_step += 1u;
+    (void)target_local_x;
+    (void)target_local_y;
+    return 1u;
+}
+
+static uint8_t rg_step_powder(
+    rg_world_t* world,
+    rg_chunk_entry_t* source_entry,
+    int32_t source_local_x,
+    int32_t source_local_y,
+    uint32_t source_index,
+    rg_material_id_t source_material_id,
+    const rg_material_record_t* source_material,
+    uint8_t primary_left)
+{
+    int32_t first_dx;
+    int32_t second_dx;
+
+    first_dx = (primary_left != 0u) ? -1 : 1;
+    second_dx = -first_dx;
+
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            0,
+            1,
+            0u) != 0u) {
+        return 1u;
+    }
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            first_dx,
+            1,
+            0u) != 0u) {
+        return 1u;
+    }
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            second_dx,
+            1,
+            0u) != 0u) {
+        return 1u;
+    }
+
+    return 0u;
+}
+
+static uint8_t rg_step_liquid(
+    rg_world_t* world,
+    rg_chunk_entry_t* source_entry,
+    int32_t source_local_x,
+    int32_t source_local_y,
+    uint32_t source_index,
+    rg_material_id_t source_material_id,
+    const rg_material_record_t* source_material,
+    uint8_t primary_left)
+{
+    int32_t first_dx;
+    int32_t second_dx;
+
+    first_dx = (primary_left != 0u) ? -1 : 1;
+    second_dx = -first_dx;
+
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            0,
+            1,
+            0u) != 0u) {
+        return 1u;
+    }
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            first_dx,
+            0,
+            0u) != 0u) {
+        return 1u;
+    }
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            second_dx,
+            0,
+            0u) != 0u) {
+        return 1u;
+    }
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            first_dx,
+            1,
+            0u) != 0u) {
+        return 1u;
+    }
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            second_dx,
+            1,
+            0u) != 0u) {
+        return 1u;
+    }
+
+    return 0u;
+}
+
+static uint8_t rg_step_gas(
+    rg_world_t* world,
+    rg_chunk_entry_t* source_entry,
+    int32_t source_local_x,
+    int32_t source_local_y,
+    uint32_t source_index,
+    rg_material_id_t source_material_id,
+    const rg_material_record_t* source_material,
+    uint8_t primary_left)
+{
+    int32_t first_dx;
+    int32_t second_dx;
+
+    first_dx = (primary_left != 0u) ? -1 : 1;
+    second_dx = -first_dx;
+
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            0,
+            -1,
+            0u) != 0u) {
+        return 1u;
+    }
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            first_dx,
+            0,
+            0u) != 0u) {
+        return 1u;
+    }
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            second_dx,
+            0,
+            0u) != 0u) {
+        return 1u;
+    }
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            first_dx,
+            -1,
+            0u) != 0u) {
+        return 1u;
+    }
+    if (rg_attempt_move(
+            world,
+            source_entry,
+            source_local_x,
+            source_local_y,
+            source_index,
+            source_material_id,
+            source_material,
+            second_dx,
+            -1,
+            0u) != 0u) {
+        return 1u;
+    }
+
+    return 0u;
+}
+
+static uint8_t rg_step_chunk_serial(rg_world_t* world, rg_chunk_entry_t* entry, uint64_t tick)
+{
+    rg_chunk_t* chunk;
+    int32_t y;
+    uint8_t changed;
+
+    if (world == NULL || entry == NULL || entry->chunk == NULL) {
+        return 0u;
+    }
+
+    chunk = entry->chunk;
+    if (chunk->live_cells == 0u) {
+        chunk->idle_steps = 0u;
+        rg_chunk_set_awake(world, chunk, 0u);
+        return 0u;
+    }
+
+    changed = 0u;
+
+    for (y = world->chunk_height - 1; y >= 0; --y) {
+        int32_t x_step;
+        uint8_t left_to_right;
+
+        left_to_right = (uint8_t)(rg_step_random(world, tick, entry->chunk_x, entry->chunk_y, 0, y, 0x71u) & 1u);
+        for (x_step = 0; x_step < world->chunk_width; ++x_step) {
+            int32_t x;
+            uint32_t index;
+            rg_material_id_t material_id;
+            const rg_material_record_t* material;
+            uint8_t primary_left;
+            uint8_t moved;
+
+            x = (left_to_right != 0u) ? x_step : (world->chunk_width - 1 - x_step);
+            index = ((uint32_t)y * (uint32_t)world->chunk_width) + (uint32_t)x;
+
+            if (rg_mask_test(chunk, index) != 0u) {
+                continue;
+            }
+
+            material_id = chunk->material_ids[index];
+            if (material_id == 0u) {
+                continue;
+            }
+
+            material = rg_material_get(world, material_id);
+            if (material == NULL) {
+                continue;
+            }
+            if ((material->flags & RG_MATERIAL_STATIC) != 0u) {
+                continue;
+            }
+
+            primary_left = (uint8_t)(rg_step_random(world, tick, entry->chunk_x, entry->chunk_y, x, y, 0xabu) & 1u);
+            moved = 0u;
+
+            if ((material->flags & RG_MATERIAL_GAS) != 0u) {
+                moved = rg_step_gas(
+                    world,
+                    entry,
+                    x,
+                    y,
+                    index,
+                    material_id,
+                    material,
+                    primary_left);
+            } else if ((material->flags & RG_MATERIAL_LIQUID) != 0u) {
+                moved = rg_step_liquid(
+                    world,
+                    entry,
+                    x,
+                    y,
+                    index,
+                    material_id,
+                    material,
+                    primary_left);
+            } else if ((material->flags & RG_MATERIAL_POWDER) != 0u) {
+                moved = rg_step_powder(
+                    world,
+                    entry,
+                    x,
+                    y,
+                    index,
+                    material_id,
+                    material,
+                    primary_left);
+            }
+
+            if (moved != 0u) {
+                changed = 1u;
+            }
+        }
+    }
+
+    if (chunk->live_cells == 0u) {
+        chunk->idle_steps = 0u;
+        rg_chunk_set_awake(world, chunk, 0u);
+    } else if (changed != 0u) {
+        chunk->idle_steps = 0u;
+        rg_chunk_set_awake(world, chunk, 1u);
+    } else {
+        if (chunk->idle_steps < UINT32_MAX) {
+            chunk->idle_steps += 1u;
+        }
+        if (chunk->idle_steps >= RG_CHUNK_SLEEP_TICKS) {
+            rg_chunk_set_awake(world, chunk, 0u);
+        }
+    }
+
+    return changed;
+}
+
+static rg_status_t rg_step_full_scan_serial(rg_world_t* world, uint64_t tick)
+{
+    uint32_t i;
+
+    if (world == NULL) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    rg_prepare_step_masks(world);
+
+    for (i = 0u; i < world->chunk_count; ++i) {
+        (void)rg_step_chunk_serial(world, &world->chunks[i], tick);
+    }
+
+    return RG_STATUS_OK;
+}
+
+static rg_status_t rg_step_chunk_scan_serial(rg_world_t* world, uint64_t tick)
+{
+    uint32_t i;
+
+    if (world == NULL) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    rg_prepare_step_masks(world);
+
+    for (i = 0u; i < world->chunk_count; ++i) {
+        rg_chunk_t* chunk;
+
+        chunk = world->chunks[i].chunk;
+        if (chunk == NULL || chunk->awake == 0u) {
+            continue;
+        }
+        (void)rg_step_chunk_serial(world, &world->chunks[i], tick);
+    }
+
+    return RG_STATUS_OK;
 }
 
 rg_status_t rg_world_create(const rg_world_config_t* cfg, rg_world_t** out_world)
@@ -526,7 +1312,6 @@ rg_status_t rg_world_create(const rg_world_config_t* cfg, rg_world_t** out_world
     if ((uint32_t)resolved_cfg.default_step_mode > (uint32_t)RG_STEP_MODE_CHUNK_CHECKERBOARD_PARALLEL) {
         return RG_STATUS_INVALID_ARGUMENT;
     }
-
     if ((uint64_t)resolved_cfg.chunk_width * (uint64_t)resolved_cfg.chunk_height > UINT32_MAX) {
         return RG_STATUS_CAPACITY_REACHED;
     }
@@ -553,12 +1338,25 @@ rg_status_t rg_world_create(const rg_world_config_t* cfg, rg_world_t** out_world
     world->inline_payload_bytes = resolved_cfg.inline_payload_bytes;
     world->max_materials = resolved_cfg.max_materials;
 
+    if (world->inline_payload_bytes > 0u) {
+        world->swap_payload = (uint8_t*)rg_alloc_bytes(
+            &world->allocator,
+            (size_t)world->inline_payload_bytes,
+            1u);
+        if (world->swap_payload == NULL) {
+            rg_free_bytes(&world->allocator, world, sizeof(*world), _Alignof(rg_world_t));
+            return RG_STATUS_ALLOCATION_FAILED;
+        }
+        memset(world->swap_payload, 0, (size_t)world->inline_payload_bytes);
+    }
+
     material_capacity = ((size_t)world->max_materials + 1u) * sizeof(*world->materials);
     world->materials = (rg_material_record_t*)rg_alloc_bytes(
         &world->allocator,
         material_capacity,
         _Alignof(rg_material_record_t));
     if (world->materials == NULL) {
+        rg_free_bytes(&world->allocator, world->swap_payload, (size_t)world->inline_payload_bytes, 1u);
         rg_free_bytes(&world->allocator, world, sizeof(*world), _Alignof(rg_world_t));
         return RG_STATUS_ALLOCATION_FAILED;
     }
@@ -567,6 +1365,7 @@ rg_status_t rg_world_create(const rg_world_config_t* cfg, rg_world_t** out_world
     status = rg_chunk_reserve(world, resolved_cfg.initial_chunk_capacity);
     if (status != RG_STATUS_OK) {
         rg_free_bytes(&world->allocator, world->materials, material_capacity, _Alignof(rg_material_record_t));
+        rg_free_bytes(&world->allocator, world->swap_payload, (size_t)world->inline_payload_bytes, 1u);
         rg_free_bytes(&world->allocator, world, sizeof(*world), _Alignof(rg_world_t));
         return status;
     }
@@ -603,6 +1402,7 @@ void rg_world_destroy(rg_world_t* world)
 
     material_capacity = ((size_t)world->max_materials + 1u) * sizeof(*world->materials);
     rg_free_bytes(&world->allocator, world->materials, material_capacity, _Alignof(rg_material_record_t));
+    rg_free_bytes(&world->allocator, world->swap_payload, (size_t)world->inline_payload_bytes, 1u);
     rg_free_bytes(&world->allocator, world, sizeof(*world), _Alignof(rg_world_t));
 }
 
@@ -619,7 +1419,6 @@ rg_status_t rg_material_register(
     if (world == NULL || desc == NULL || out_material_id == NULL || desc->name == NULL || desc->name[0] == '\0') {
         return RG_STATUS_INVALID_ARGUMENT;
     }
-
     if (world->material_count >= world->max_materials) {
         return RG_STATUS_CAPACITY_REACHED;
     }
@@ -672,11 +1471,11 @@ rg_status_t rg_chunk_load(rg_world_t* world, int32_t chunk_x, int32_t chunk_y)
 {
     rg_chunk_t* chunk;
     rg_status_t status;
+    uint32_t insert_index;
 
     if (world == NULL) {
         return RG_STATUS_INVALID_ARGUMENT;
     }
-
     if (rg_chunk_find_index(world, chunk_x, chunk_y) != UINT32_MAX) {
         return RG_STATUS_ALREADY_EXISTS;
     }
@@ -691,11 +1490,18 @@ rg_status_t rg_chunk_load(rg_world_t* world, int32_t chunk_x, int32_t chunk_y)
         return status;
     }
 
-    world->chunks[world->chunk_count].chunk_x = chunk_x;
-    world->chunks[world->chunk_count].chunk_y = chunk_y;
-    world->chunks[world->chunk_count].chunk = chunk;
-    world->chunk_count += 1u;
+    insert_index = rg_chunk_insert_index(world, chunk_x, chunk_y);
+    if (insert_index < world->chunk_count) {
+        memmove(
+            &world->chunks[insert_index + 1u],
+            &world->chunks[insert_index],
+            (size_t)(world->chunk_count - insert_index) * sizeof(*world->chunks));
+    }
 
+    world->chunks[insert_index].chunk_x = chunk_x;
+    world->chunks[insert_index].chunk_y = chunk_y;
+    world->chunks[insert_index].chunk = chunk;
+    world->chunk_count += 1u;
     return RG_STATUS_OK;
 }
 
@@ -715,24 +1521,24 @@ rg_status_t rg_chunk_unload(rg_world_t* world, int32_t chunk_x, int32_t chunk_y)
 
     chunk = world->chunks[index].chunk;
     if (chunk != NULL) {
-        if (chunk->live_cells > 0u) {
-            if (world->live_cells >= chunk->live_cells) {
-                world->live_cells -= chunk->live_cells;
-            } else {
-                world->live_cells = 0u;
-            }
-            if (world->active_chunk_count > 0u) {
-                world->active_chunk_count -= 1u;
-            }
+        if (world->live_cells >= chunk->live_cells) {
+            world->live_cells -= chunk->live_cells;
+        } else {
+            world->live_cells = 0u;
+        }
+        if (chunk->awake != 0u && world->active_chunk_count > 0u) {
+            world->active_chunk_count -= 1u;
         }
         rg_chunk_destroy(world, chunk);
     }
 
     if (index + 1u < world->chunk_count) {
-        world->chunks[index] = world->chunks[world->chunk_count - 1u];
+        memmove(
+            &world->chunks[index],
+            &world->chunks[index + 1u],
+            (size_t)(world->chunk_count - index - 1u) * sizeof(*world->chunks));
     }
     world->chunk_count -= 1u;
-
     return RG_STATUS_OK;
 }
 
@@ -770,7 +1576,6 @@ rg_status_t rg_cell_get(
     if (material == NULL) {
         return RG_STATUS_NOT_FOUND;
     }
-
     if (material->instance_size > 0u) {
         out_cell->instance_data = rg_chunk_payload_ptr_const(world, chunk, cell_index);
     }
@@ -795,7 +1600,6 @@ rg_status_t rg_cell_set(
     if (world == NULL || value == NULL) {
         return RG_STATUS_INVALID_ARGUMENT;
     }
-
     if (value->material_id == 0u) {
         return rg_cell_clear(world, cell);
     }
@@ -826,6 +1630,8 @@ rg_status_t rg_cell_set(
 
     chunk->material_ids[cell_index] = new_material_id;
     rg_update_live_counts(world, chunk, old_material_id, new_material_id);
+    chunk->idle_steps = 0u;
+    rg_chunk_set_awake(world, chunk, (uint8_t)(chunk->live_cells > 0u));
     return RG_STATUS_OK;
 }
 
@@ -867,6 +1673,8 @@ rg_status_t rg_world_step(rg_world_t* world, const rg_step_options_t* options)
 {
     rg_step_mode_t mode;
     uint32_t substeps;
+    uint32_t substep_index;
+    rg_status_t status;
 
     if (world == NULL) {
         return RG_STATUS_INVALID_ARGUMENT;
@@ -874,7 +1682,6 @@ rg_status_t rg_world_step(rg_world_t* world, const rg_step_options_t* options)
 
     mode = world->default_step_mode;
     substeps = 1u;
-
     if (options != NULL) {
         mode = options->mode;
         if (options->substeps > 0u) {
@@ -886,10 +1693,35 @@ rg_status_t rg_world_step(rg_world_t* world, const rg_step_options_t* options)
         return RG_STATUS_INVALID_ARGUMENT;
     }
 
-    world->step_index += (uint64_t)substeps;
     world->intents_emitted_last_step = 0u;
     world->intent_conflicts_last_step = 0u;
 
+    for (substep_index = 0u; substep_index < substeps; ++substep_index) {
+        uint64_t tick;
+
+        tick = world->step_index + (uint64_t)substep_index + 1u;
+        switch (mode) {
+        case RG_STEP_MODE_FULL_SCAN_SERIAL:
+            status = rg_step_full_scan_serial(world, tick);
+            break;
+        case RG_STEP_MODE_CHUNK_SCAN_SERIAL:
+            status = rg_step_chunk_scan_serial(world, tick);
+            break;
+        case RG_STEP_MODE_CHUNK_CHECKERBOARD_PARALLEL:
+            /* Temporary behavior until checkerboard backend is implemented. */
+            status = rg_step_chunk_scan_serial(world, tick);
+            break;
+        default:
+            status = RG_STATUS_INVALID_ARGUMENT;
+            break;
+        }
+
+        if (status != RG_STATUS_OK) {
+            return status;
+        }
+    }
+
+    world->step_index += (uint64_t)substeps;
     return RG_STATUS_OK;
 }
 

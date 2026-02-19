@@ -92,6 +92,23 @@ static int register_material(
     return 0;
 }
 
+static int register_simple_material(
+    rg_world_t* world,
+    const char* name,
+    uint32_t flags,
+    float density,
+    rg_material_id_t* out_material_id)
+{
+    rg_material_desc_t desc;
+
+    memset(&desc, 0, sizeof(desc));
+    desc.name = name;
+    desc.flags = flags;
+    desc.density = density;
+    ASSERT_STATUS(rg_material_register(world, &desc, out_material_id), RG_STATUS_OK);
+    return 0;
+}
+
 static int test_world_create_defaults(void)
 {
     rg_world_t* world;
@@ -289,6 +306,161 @@ static int test_step_and_stats(void)
     return 0;
 }
 
+static int test_powder_falls_in_full_scan(void)
+{
+    rg_world_t* world;
+    rg_world_config_t cfg;
+    rg_material_id_t sand_id;
+    rg_cell_write_t write;
+    rg_cell_read_t read;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.chunk_width = 8;
+    cfg.chunk_height = 8;
+    cfg.default_step_mode = RG_STEP_MODE_FULL_SCAN_SERIAL;
+    cfg.deterministic_mode = 1u;
+    cfg.deterministic_seed = 123u;
+    ASSERT_STATUS(rg_world_create(&cfg, &world), RG_STATUS_OK);
+
+    ASSERT_TRUE(register_simple_material(world, "sand", RG_MATERIAL_POWDER, 10.0f, &sand_id) == 0);
+    ASSERT_STATUS(rg_chunk_load(world, 0, 0), RG_STATUS_OK);
+
+    memset(&write, 0, sizeof(write));
+    write.material_id = sand_id;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){3, 1}, &write), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_world_step(world, NULL), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){3, 1}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == 0u);
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){3, 2}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == sand_id);
+
+    rg_world_destroy(world);
+    return 0;
+}
+
+static int test_liquid_flows_sideways_when_blocked(void)
+{
+    rg_world_t* world;
+    rg_world_config_t cfg;
+    rg_material_id_t water_id;
+    rg_material_id_t stone_id;
+    rg_cell_write_t write;
+    rg_cell_read_t read;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.chunk_width = 8;
+    cfg.chunk_height = 8;
+    cfg.default_step_mode = RG_STEP_MODE_FULL_SCAN_SERIAL;
+    cfg.deterministic_mode = 1u;
+    cfg.deterministic_seed = 99u;
+    ASSERT_STATUS(rg_world_create(&cfg, &world), RG_STATUS_OK);
+
+    ASSERT_TRUE(register_simple_material(world, "water", RG_MATERIAL_LIQUID, 5.0f, &water_id) == 0);
+    ASSERT_TRUE(register_simple_material(world, "stone", RG_MATERIAL_STATIC, 100.0f, &stone_id) == 0);
+    ASSERT_STATUS(rg_chunk_load(world, 0, 0), RG_STATUS_OK);
+
+    memset(&write, 0, sizeof(write));
+    write.material_id = stone_id;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){4, 5}, &write), RG_STATUS_OK);
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){3, 4}, &write), RG_STATUS_OK);
+
+    write.material_id = water_id;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){4, 4}, &write), RG_STATUS_OK);
+    ASSERT_STATUS(rg_world_step(world, NULL), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){4, 4}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == 0u);
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){5, 4}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == water_id);
+
+    rg_world_destroy(world);
+    return 0;
+}
+
+static int test_cross_chunk_fall(void)
+{
+    rg_world_t* world;
+    rg_world_config_t cfg;
+    rg_material_id_t sand_id;
+    rg_cell_write_t write;
+    rg_cell_read_t read;
+    rg_world_stats_t stats;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.chunk_width = 4;
+    cfg.chunk_height = 4;
+    cfg.default_step_mode = RG_STEP_MODE_FULL_SCAN_SERIAL;
+    cfg.deterministic_mode = 1u;
+    cfg.deterministic_seed = 5u;
+    ASSERT_STATUS(rg_world_create(&cfg, &world), RG_STATUS_OK);
+
+    ASSERT_TRUE(register_simple_material(world, "sand", RG_MATERIAL_POWDER, 10.0f, &sand_id) == 0);
+    ASSERT_STATUS(rg_chunk_load(world, 0, 0), RG_STATUS_OK);
+    ASSERT_STATUS(rg_chunk_load(world, 0, 1), RG_STATUS_OK);
+
+    memset(&write, 0, sizeof(write));
+    write.material_id = sand_id;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){1, 3}, &write), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_world_step(world, NULL), RG_STATUS_OK);
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){1, 3}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == 0u);
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){1, 4}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == sand_id);
+
+    ASSERT_STATUS(rg_world_get_stats(world, &stats), RG_STATUS_OK);
+    ASSERT_TRUE(stats.live_cells == 1u);
+    ASSERT_TRUE(stats.active_chunks == 1u);
+
+    rg_world_destroy(world);
+    return 0;
+}
+
+static int test_chunk_scan_sleep_and_wake(void)
+{
+    rg_world_t* world;
+    rg_world_config_t cfg;
+    rg_material_id_t stone_id;
+    rg_cell_write_t write;
+    rg_step_options_t step_options;
+    rg_world_stats_t stats;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.chunk_width = 8;
+    cfg.chunk_height = 8;
+    cfg.default_step_mode = RG_STEP_MODE_CHUNK_SCAN_SERIAL;
+    cfg.deterministic_mode = 1u;
+    cfg.deterministic_seed = 42u;
+    ASSERT_STATUS(rg_world_create(&cfg, &world), RG_STATUS_OK);
+
+    ASSERT_TRUE(register_simple_material(world, "stone", RG_MATERIAL_STATIC, 100.0f, &stone_id) == 0);
+    ASSERT_STATUS(rg_chunk_load(world, 0, 0), RG_STATUS_OK);
+
+    memset(&write, 0, sizeof(write));
+    write.material_id = stone_id;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){2, 2}, &write), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_world_get_stats(world, &stats), RG_STATUS_OK);
+    ASSERT_TRUE(stats.active_chunks == 1u);
+
+    memset(&step_options, 0, sizeof(step_options));
+    step_options.mode = RG_STEP_MODE_CHUNK_SCAN_SERIAL;
+    step_options.substeps = 16u;
+    ASSERT_STATUS(rg_world_step(world, &step_options), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_world_get_stats(world, &stats), RG_STATUS_OK);
+    ASSERT_TRUE(stats.active_chunks == 0u);
+
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){3, 2}, &write), RG_STATUS_OK);
+    ASSERT_STATUS(rg_world_get_stats(world, &stats), RG_STATUS_OK);
+    ASSERT_TRUE(stats.active_chunks == 1u);
+
+    rg_world_destroy(world);
+    return 0;
+}
+
 static int test_unloaded_chunk_cell_access(void)
 {
     rg_world_t* world;
@@ -321,6 +493,10 @@ int main(void)
     RUN_TEST(test_cell_set_get_clear_and_nonfungible_payload);
     RUN_TEST(test_ctor_dtor_behavior);
     RUN_TEST(test_step_and_stats);
+    RUN_TEST(test_powder_falls_in_full_scan);
+    RUN_TEST(test_liquid_flows_sideways_when_blocked);
+    RUN_TEST(test_cross_chunk_fall);
+    RUN_TEST(test_chunk_scan_sleep_and_wake);
     RUN_TEST(test_unloaded_chunk_cell_access);
 
     printf("regolith tests passed\n");
