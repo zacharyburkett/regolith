@@ -37,6 +37,11 @@ typedef struct test_cell_data_s {
     int32_t temperature;
 } test_cell_data_t;
 
+typedef struct test_big_payload_s {
+    uint32_t marker;
+    uint8_t bytes[48];
+} test_big_payload_t;
+
 typedef struct test_material_user_s {
     int ctor_count;
     int dtor_count;
@@ -980,6 +985,95 @@ static int test_custom_update_random_is_seeded(void)
     return 0;
 }
 
+static int test_overflow_instance_payload_support(void)
+{
+    rg_world_t* world;
+    rg_world_config_t cfg;
+    rg_material_desc_t desc;
+    rg_material_id_t heavy_id;
+    rg_material_id_t light_id;
+    rg_cell_write_t write;
+    rg_cell_read_t read;
+    rg_world_stats_t stats;
+    test_big_payload_t heavy_payload;
+    test_big_payload_t* heavy_out;
+    test_cell_data_t light_payload;
+    const test_cell_data_t* light_out;
+    uint32_t i;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.chunk_width = 8;
+    cfg.chunk_height = 8;
+    cfg.default_step_mode = RG_STEP_MODE_FULL_SCAN_SERIAL;
+    cfg.deterministic_mode = 1u;
+    cfg.deterministic_seed = 444u;
+    ASSERT_STATUS(rg_world_create(&cfg, &world), RG_STATUS_OK);
+    ASSERT_STATUS(rg_chunk_load(world, 0, 0), RG_STATUS_OK);
+
+    memset(&desc, 0, sizeof(desc));
+    desc.name = "heavy_overflow";
+    desc.flags = RG_MATERIAL_POWDER;
+    desc.density = 10.0f;
+    desc.instance_size = (uint16_t)sizeof(test_big_payload_t);
+    desc.instance_align = (uint16_t)_Alignof(test_big_payload_t);
+    ASSERT_STATUS(rg_material_register(world, &desc, &heavy_id), RG_STATUS_OK);
+
+    memset(&desc, 0, sizeof(desc));
+    desc.name = "light_inline";
+    desc.flags = RG_MATERIAL_SOLID;
+    desc.density = 1.0f;
+    desc.instance_size = (uint16_t)sizeof(test_cell_data_t);
+    desc.instance_align = (uint16_t)_Alignof(test_cell_data_t);
+    ASSERT_STATUS(rg_material_register(world, &desc, &light_id), RG_STATUS_OK);
+
+    heavy_payload.marker = 0xDEADBEEFu;
+    for (i = 0u; i < sizeof(heavy_payload.bytes); ++i) {
+        heavy_payload.bytes[i] = (uint8_t)(i * 3u);
+    }
+    memset(&write, 0, sizeof(write));
+    write.material_id = heavy_id;
+    write.instance_data = &heavy_payload;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){2, 2}, &write), RG_STATUS_OK);
+
+    light_payload.id = 22u;
+    light_payload.temperature = 77;
+    write.material_id = light_id;
+    write.instance_data = &light_payload;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){2, 3}, &write), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_world_get_stats(world, &stats), RG_STATUS_OK);
+    ASSERT_TRUE(stats.payload_overflow_allocs == 1u);
+    ASSERT_TRUE(stats.payload_overflow_frees == 0u);
+
+    ASSERT_STATUS(rg_world_step(world, NULL), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){2, 3}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == heavy_id);
+    ASSERT_TRUE(read.instance_data != NULL);
+    heavy_out = (test_big_payload_t*)read.instance_data;
+    ASSERT_TRUE(heavy_out->marker == 0xDEADBEEFu);
+    ASSERT_TRUE(memcmp(heavy_out->bytes, heavy_payload.bytes, sizeof(heavy_payload.bytes)) == 0);
+
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){2, 2}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == light_id);
+    ASSERT_TRUE(read.instance_data != NULL);
+    light_out = (const test_cell_data_t*)read.instance_data;
+    ASSERT_TRUE(light_out->id == 22u);
+    ASSERT_TRUE(light_out->temperature == 77);
+
+    ASSERT_STATUS(rg_world_get_stats(world, &stats), RG_STATUS_OK);
+    ASSERT_TRUE(stats.payload_overflow_allocs == 1u);
+    ASSERT_TRUE(stats.payload_overflow_frees == 0u);
+
+    ASSERT_STATUS(rg_cell_clear(world, (rg_cell_coord_t){2, 3}), RG_STATUS_OK);
+    ASSERT_STATUS(rg_world_get_stats(world, &stats), RG_STATUS_OK);
+    ASSERT_TRUE(stats.payload_overflow_allocs == 1u);
+    ASSERT_TRUE(stats.payload_overflow_frees == 1u);
+
+    rg_world_destroy(world);
+    return 0;
+}
+
 int main(void)
 {
     RUN_TEST(test_world_create_defaults);
@@ -1000,6 +1094,7 @@ int main(void)
     RUN_TEST(test_custom_update_try_swap);
     RUN_TEST(test_custom_update_transform_in_checkerboard);
     RUN_TEST(test_custom_update_random_is_seeded);
+    RUN_TEST(test_overflow_instance_payload_support);
 
     printf("regolith tests passed\n");
     return 0;

@@ -35,6 +35,7 @@ typedef struct rg_material_record_s {
 typedef struct rg_chunk_s {
     uint16_t* material_ids;
     uint8_t* inline_payload;
+    void** overflow_payloads;
     uint8_t* updated_mask;
     uint32_t live_cells;
     uint32_t idle_steps;
@@ -459,6 +460,16 @@ static const rg_material_record_t* rg_material_get(
     return &world->materials[material_id];
 }
 
+static uint8_t rg_material_uses_overflow(
+    const rg_world_t* world,
+    const rg_material_record_t* material)
+{
+    if (world == NULL || material == NULL) {
+        return 0u;
+    }
+    return (uint8_t)(material->instance_size > world->inline_payload_bytes);
+}
+
 static void* rg_chunk_payload_ptr(rg_world_t* world, rg_chunk_t* chunk, uint32_t cell_index)
 {
     if (world == NULL || chunk == NULL || chunk->inline_payload == NULL || world->inline_payload_bytes == 0u) {
@@ -478,6 +489,46 @@ static const void* rg_chunk_payload_ptr_const(
     return chunk->inline_payload + ((size_t)cell_index * (size_t)world->inline_payload_bytes);
 }
 
+static void* rg_chunk_instance_ptr(
+    rg_world_t* world,
+    rg_chunk_t* chunk,
+    uint32_t cell_index,
+    const rg_material_record_t* material)
+{
+    if (world == NULL || chunk == NULL || material == NULL || material->instance_size == 0u) {
+        return NULL;
+    }
+
+    if (rg_material_uses_overflow(world, material) != 0u) {
+        if (chunk->overflow_payloads == NULL) {
+            return NULL;
+        }
+        return chunk->overflow_payloads[cell_index];
+    }
+
+    return rg_chunk_payload_ptr(world, chunk, cell_index);
+}
+
+static const void* rg_chunk_instance_ptr_const(
+    const rg_world_t* world,
+    const rg_chunk_t* chunk,
+    uint32_t cell_index,
+    const rg_material_record_t* material)
+{
+    if (world == NULL || chunk == NULL || material == NULL || material->instance_size == 0u) {
+        return NULL;
+    }
+
+    if (rg_material_uses_overflow(world, material) != 0u) {
+        if (chunk->overflow_payloads == NULL) {
+            return NULL;
+        }
+        return chunk->overflow_payloads[cell_index];
+    }
+
+    return rg_chunk_payload_ptr_const(world, chunk, cell_index);
+}
+
 static void rg_release_cell_instance(
     rg_world_t* world,
     rg_chunk_t* chunk,
@@ -490,15 +541,27 @@ static void rg_release_cell_instance(
         return;
     }
 
-    payload = rg_chunk_payload_ptr(world, chunk, cell_index);
-    if (payload == NULL) {
+    payload = rg_chunk_instance_ptr(world, chunk, cell_index, material);
+    if (payload != NULL && material->instance_dtor != NULL) {
+        material->instance_dtor(payload, material->user_data);
+    }
+
+    if (rg_material_uses_overflow(world, material) != 0u) {
+        if (chunk->overflow_payloads != NULL && chunk->overflow_payloads[cell_index] != NULL) {
+            rg_free_bytes(
+                &world->allocator,
+                chunk->overflow_payloads[cell_index],
+                material->instance_size,
+                material->instance_align);
+            chunk->overflow_payloads[cell_index] = NULL;
+            world->payload_overflow_frees += 1u;
+        }
         return;
     }
 
-    if (material->instance_dtor != NULL) {
-        material->instance_dtor(payload, material->user_data);
+    if (payload != NULL) {
+        memset(payload, 0, (size_t)world->inline_payload_bytes);
     }
-    memset(payload, 0, (size_t)world->inline_payload_bytes);
 }
 
 static rg_status_t rg_write_cell_instance(
@@ -518,9 +581,39 @@ static rg_status_t rg_write_cell_instance(
         return RG_STATUS_OK;
     }
 
+    if (rg_material_uses_overflow(world, material) != 0u) {
+        if (chunk->overflow_payloads == NULL) {
+            return RG_STATUS_ALLOCATION_FAILED;
+        }
+
+        payload = rg_alloc_bytes(&world->allocator, material->instance_size, material->instance_align);
+        if (payload == NULL) {
+            return RG_STATUS_ALLOCATION_FAILED;
+        }
+        memset(payload, 0, material->instance_size);
+
+        if (instance_data != NULL) {
+            memmove(payload, instance_data, material->instance_size);
+        } else if (material->instance_ctor != NULL) {
+            material->instance_ctor(payload, material->user_data);
+        }
+
+        chunk->overflow_payloads[cell_index] = payload;
+        world->payload_overflow_allocs += 1u;
+
+        if (world->inline_payload_bytes > 0u && chunk->inline_payload != NULL) {
+            void* inline_payload;
+            inline_payload = rg_chunk_payload_ptr(world, chunk, cell_index);
+            if (inline_payload != NULL) {
+                memset(inline_payload, 0, (size_t)world->inline_payload_bytes);
+            }
+        }
+        return RG_STATUS_OK;
+    }
+
     payload = rg_chunk_payload_ptr(world, chunk, cell_index);
     if (payload == NULL) {
-        return RG_STATUS_UNSUPPORTED;
+        return RG_STATUS_INVALID_ARGUMENT;
     }
 
     memset(payload, 0, (size_t)world->inline_payload_bytes);
@@ -528,6 +621,10 @@ static rg_status_t rg_write_cell_instance(
         memmove(payload, instance_data, material->instance_size);
     } else if (material->instance_ctor != NULL) {
         material->instance_ctor(payload, material->user_data);
+    }
+
+    if (chunk->overflow_payloads != NULL) {
+        chunk->overflow_payloads[cell_index] = NULL;
     }
 
     return RG_STATUS_OK;
@@ -608,6 +705,7 @@ static rg_status_t rg_chunk_create(rg_world_t* world, rg_chunk_t** out_chunk)
     rg_chunk_t* chunk;
     size_t material_bytes;
     size_t payload_bytes;
+    size_t overflow_bytes;
     size_t mask_bytes;
 
     if (world == NULL || out_chunk == NULL) {
@@ -644,9 +742,23 @@ static rg_status_t rg_chunk_create(rg_world_t* world, rg_chunk_t** out_chunk)
         memset(chunk->inline_payload, 0, payload_bytes);
     }
 
+    overflow_bytes = (size_t)world->cells_per_chunk * sizeof(*chunk->overflow_payloads);
+    chunk->overflow_payloads = (void**)rg_alloc_bytes(
+        &world->allocator,
+        overflow_bytes,
+        _Alignof(void*));
+    if (chunk->overflow_payloads == NULL) {
+        rg_free_bytes(&world->allocator, chunk->inline_payload, payload_bytes, 1u);
+        rg_free_bytes(&world->allocator, chunk->material_ids, material_bytes, _Alignof(uint16_t));
+        rg_free_bytes(&world->allocator, chunk, sizeof(*chunk), _Alignof(rg_chunk_t));
+        return RG_STATUS_ALLOCATION_FAILED;
+    }
+    memset(chunk->overflow_payloads, 0, overflow_bytes);
+
     mask_bytes = ((size_t)world->cells_per_chunk + 7u) / 8u;
     chunk->updated_mask = (uint8_t*)rg_alloc_bytes(&world->allocator, mask_bytes, 1u);
     if (chunk->updated_mask == NULL) {
+        rg_free_bytes(&world->allocator, chunk->overflow_payloads, overflow_bytes, _Alignof(void*));
         rg_free_bytes(&world->allocator, chunk->inline_payload, payload_bytes, 1u);
         rg_free_bytes(&world->allocator, chunk->material_ids, material_bytes, _Alignof(uint16_t));
         rg_free_bytes(&world->allocator, chunk, sizeof(*chunk), _Alignof(rg_chunk_t));
@@ -665,6 +777,7 @@ static void rg_chunk_destroy(rg_world_t* world, rg_chunk_t* chunk)
 {
     size_t material_bytes;
     size_t payload_bytes;
+    size_t overflow_bytes;
     size_t mask_bytes;
     uint32_t i;
 
@@ -689,9 +802,11 @@ static void rg_chunk_destroy(rg_world_t* world, rg_chunk_t* chunk)
 
     material_bytes = (size_t)world->cells_per_chunk * sizeof(*chunk->material_ids);
     payload_bytes = (size_t)world->cells_per_chunk * (size_t)world->inline_payload_bytes;
+    overflow_bytes = (size_t)world->cells_per_chunk * sizeof(*chunk->overflow_payloads);
     mask_bytes = ((size_t)world->cells_per_chunk + 7u) / 8u;
 
     rg_free_bytes(&world->allocator, chunk->updated_mask, mask_bytes, 1u);
+    rg_free_bytes(&world->allocator, chunk->overflow_payloads, overflow_bytes, _Alignof(void*));
     rg_free_bytes(&world->allocator, chunk->inline_payload, payload_bytes, 1u);
     rg_free_bytes(&world->allocator, chunk->material_ids, material_bytes, _Alignof(uint16_t));
     rg_free_bytes(&world->allocator, chunk, sizeof(*chunk), _Alignof(rg_chunk_t));
@@ -909,24 +1024,29 @@ static void rg_payload_swap(
 {
     void* payload_a;
     void* payload_b;
+    void* overflow_a;
+    void* overflow_b;
 
-    if (world == NULL ||
-        world->inline_payload_bytes == 0u ||
-        world->swap_payload == NULL ||
-        chunk_a == NULL ||
-        chunk_b == NULL) {
+    if (world == NULL || chunk_a == NULL || chunk_b == NULL) {
         return;
     }
 
-    payload_a = rg_chunk_payload_ptr(world, chunk_a, index_a);
-    payload_b = rg_chunk_payload_ptr(world, chunk_b, index_b);
-    if (payload_a == NULL || payload_b == NULL) {
-        return;
+    if (world->inline_payload_bytes > 0u && world->swap_payload != NULL) {
+        payload_a = rg_chunk_payload_ptr(world, chunk_a, index_a);
+        payload_b = rg_chunk_payload_ptr(world, chunk_b, index_b);
+        if (payload_a != NULL && payload_b != NULL) {
+            memmove(world->swap_payload, payload_a, (size_t)world->inline_payload_bytes);
+            memmove(payload_a, payload_b, (size_t)world->inline_payload_bytes);
+            memmove(payload_b, world->swap_payload, (size_t)world->inline_payload_bytes);
+        }
     }
 
-    memmove(world->swap_payload, payload_a, (size_t)world->inline_payload_bytes);
-    memmove(payload_a, payload_b, (size_t)world->inline_payload_bytes);
-    memmove(payload_b, world->swap_payload, (size_t)world->inline_payload_bytes);
+    if (chunk_a->overflow_payloads != NULL && chunk_b->overflow_payloads != NULL) {
+        overflow_a = chunk_a->overflow_payloads[index_a];
+        overflow_b = chunk_b->overflow_payloads[index_b];
+        chunk_a->overflow_payloads[index_a] = overflow_b;
+        chunk_b->overflow_payloads[index_b] = overflow_a;
+    }
 }
 
 static void rg_payload_move(
@@ -941,6 +1061,28 @@ static void rg_payload_move(
     void* target_payload;
 
     if (world == NULL || material == NULL || material->instance_size == 0u) {
+        return;
+    }
+
+    if (rg_material_uses_overflow(world, material) != 0u) {
+        if (source_chunk != NULL &&
+            target_chunk != NULL &&
+            source_chunk->overflow_payloads != NULL &&
+            target_chunk->overflow_payloads != NULL) {
+            target_chunk->overflow_payloads[target_index] = source_chunk->overflow_payloads[source_index];
+            source_chunk->overflow_payloads[source_index] = NULL;
+
+            if (world->inline_payload_bytes > 0u) {
+                source_payload = rg_chunk_payload_ptr(world, source_chunk, source_index);
+                target_payload = rg_chunk_payload_ptr(world, target_chunk, target_index);
+                if (source_payload != NULL) {
+                    memset(source_payload, 0, (size_t)world->inline_payload_bytes);
+                }
+                if (target_payload != NULL) {
+                    memset(target_payload, 0, (size_t)world->inline_payload_bytes);
+                }
+            }
+        }
         return;
     }
 
@@ -1620,7 +1762,7 @@ static uint8_t rg_step_chunk_serial(
 
                 instance_data = NULL;
                 if (material->instance_size > 0u) {
-                    instance_data = rg_chunk_payload_ptr(world, chunk, index);
+                    instance_data = rg_chunk_instance_ptr(world, chunk, index, material);
                 }
 
                 material->update_fn(
@@ -2060,9 +2202,6 @@ rg_status_t rg_material_register(
     if (!rg_is_power_of_two_u32(instance_align)) {
         return RG_STATUS_INVALID_ARGUMENT;
     }
-    if (desc->instance_size > world->inline_payload_bytes) {
-        return RG_STATUS_UNSUPPORTED;
-    }
 
     new_id = world->material_count + 1u;
     record = &world->materials[new_id];
@@ -2201,7 +2340,7 @@ rg_status_t rg_cell_get(
         return RG_STATUS_NOT_FOUND;
     }
     if (material->instance_size > 0u) {
-        out_cell->instance_data = rg_chunk_payload_ptr_const(world, chunk, cell_index);
+        out_cell->instance_data = rg_chunk_instance_ptr_const(world, chunk, cell_index, material);
     }
 
     return RG_STATUS_OK;
@@ -2249,6 +2388,10 @@ rg_status_t rg_cell_set(
 
     status = rg_write_cell_instance(world, chunk, cell_index, new_material, value->instance_data);
     if (status != RG_STATUS_OK) {
+        if (old_material_id != 0u) {
+            chunk->material_ids[cell_index] = 0u;
+            rg_update_live_counts(world, chunk, old_material_id, 0u);
+        }
         return status;
     }
 
@@ -2452,6 +2595,8 @@ static rg_status_t rg_ctx_transform_current_cell(
         new_material_record,
         new_instance_data);
     if (status != RG_STATUS_OK) {
+        source_chunk->material_ids[ctx->source_cell_index] = 0u;
+        rg_update_live_counts(world, source_chunk, old_material_id, 0u);
         return status;
     }
 
