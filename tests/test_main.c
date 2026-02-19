@@ -95,6 +95,111 @@ static const rg_runner_vtable_t g_test_runner_vtable = {
     test_runner_worker_count
 };
 
+typedef struct test_custom_move_user_s {
+    uint32_t call_count;
+} test_custom_move_user_t;
+
+typedef struct test_custom_swap_user_s {
+    uint32_t call_count;
+} test_custom_swap_user_t;
+
+typedef struct test_custom_transform_user_s {
+    uint32_t call_count;
+    rg_material_id_t target_material_id;
+} test_custom_transform_user_t;
+
+typedef struct test_custom_random_user_s {
+    uint32_t call_count;
+} test_custom_random_user_t;
+
+static void test_custom_move_update(
+    rg_update_ctx_t* ctx,
+    rg_cell_coord_t cell,
+    rg_material_id_t material_id,
+    void* instance_data,
+    void* user_data)
+{
+    test_custom_move_user_t* user;
+    test_cell_data_t* payload;
+
+    (void)material_id;
+
+    user = (test_custom_move_user_t*)user_data;
+    if (user != NULL) {
+        user->call_count += 1u;
+    }
+
+    payload = (test_cell_data_t*)instance_data;
+    if (payload != NULL) {
+        payload->temperature += 10;
+    }
+
+    (void)rg_ctx_try_move(ctx, cell, (rg_cell_coord_t){cell.x, cell.y + 1});
+}
+
+static void test_custom_swap_update(
+    rg_update_ctx_t* ctx,
+    rg_cell_coord_t cell,
+    rg_material_id_t material_id,
+    void* instance_data,
+    void* user_data)
+{
+    test_custom_swap_user_t* user;
+
+    (void)material_id;
+    (void)instance_data;
+
+    user = (test_custom_swap_user_t*)user_data;
+    if (user != NULL) {
+        user->call_count += 1u;
+    }
+
+    (void)rg_ctx_try_swap(ctx, cell, (rg_cell_coord_t){cell.x + 1, cell.y});
+}
+
+static void test_custom_transform_update(
+    rg_update_ctx_t* ctx,
+    rg_cell_coord_t cell,
+    rg_material_id_t material_id,
+    void* instance_data,
+    void* user_data)
+{
+    test_custom_transform_user_t* user;
+
+    (void)material_id;
+    (void)instance_data;
+
+    user = (test_custom_transform_user_t*)user_data;
+    if (user != NULL) {
+        user->call_count += 1u;
+        (void)rg_ctx_transform(ctx, cell, user->target_material_id, NULL);
+    }
+}
+
+static void test_custom_random_update(
+    rg_update_ctx_t* ctx,
+    rg_cell_coord_t cell,
+    rg_material_id_t material_id,
+    void* instance_data,
+    void* user_data)
+{
+    test_custom_random_user_t* user;
+    test_cell_data_t* payload;
+
+    (void)cell;
+    (void)material_id;
+
+    user = (test_custom_random_user_t*)user_data;
+    if (user != NULL) {
+        user->call_count += 1u;
+    }
+
+    payload = (test_cell_data_t*)instance_data;
+    if (payload != NULL) {
+        payload->id = rg_ctx_random_u32(ctx);
+    }
+}
+
 static void test_ctor(void* dst, void* user_data)
 {
     test_material_user_t* user;
@@ -644,6 +749,237 @@ static int test_checkerboard_parallel_conflict_resolution(void)
     return 0;
 }
 
+static int test_custom_update_try_move_with_payload(void)
+{
+    rg_world_t* world;
+    rg_world_config_t cfg;
+    rg_material_desc_t desc;
+    rg_material_id_t custom_id;
+    rg_cell_write_t write;
+    rg_cell_read_t read;
+    test_custom_move_user_t move_user;
+    test_cell_data_t payload;
+    const test_cell_data_t* out_payload;
+
+    memset(&move_user, 0, sizeof(move_user));
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.chunk_width = 4;
+    cfg.chunk_height = 4;
+    cfg.default_step_mode = RG_STEP_MODE_FULL_SCAN_SERIAL;
+    cfg.deterministic_mode = 1u;
+    cfg.deterministic_seed = 77u;
+    ASSERT_STATUS(rg_world_create(&cfg, &world), RG_STATUS_OK);
+    ASSERT_STATUS(rg_chunk_load(world, 0, 0), RG_STATUS_OK);
+
+    memset(&desc, 0, sizeof(desc));
+    desc.name = "custom_move";
+    desc.flags = RG_MATERIAL_CUSTOM_UPDATE;
+    desc.instance_size = (uint16_t)sizeof(test_cell_data_t);
+    desc.instance_align = (uint16_t)_Alignof(test_cell_data_t);
+    desc.update_fn = test_custom_move_update;
+    desc.user_data = &move_user;
+    ASSERT_STATUS(rg_material_register(world, &desc, &custom_id), RG_STATUS_OK);
+
+    payload.id = 7u;
+    payload.temperature = 1;
+    memset(&write, 0, sizeof(write));
+    write.material_id = custom_id;
+    write.instance_data = &payload;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){1, 1}, &write), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_world_step(world, NULL), RG_STATUS_OK);
+    ASSERT_TRUE(move_user.call_count == 1u);
+
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){1, 1}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == 0u);
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){1, 2}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == custom_id);
+    ASSERT_TRUE(read.instance_data != NULL);
+    out_payload = (const test_cell_data_t*)read.instance_data;
+    ASSERT_TRUE(out_payload->id == 7u);
+    ASSERT_TRUE(out_payload->temperature == 11);
+
+    rg_world_destroy(world);
+    return 0;
+}
+
+static int test_custom_update_try_swap(void)
+{
+    rg_world_t* world;
+    rg_world_config_t cfg;
+    rg_material_desc_t desc;
+    rg_material_id_t swapper_id;
+    rg_material_id_t neighbor_id;
+    rg_cell_write_t write;
+    rg_cell_read_t read;
+    test_custom_swap_user_t swap_user;
+
+    memset(&swap_user, 0, sizeof(swap_user));
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.chunk_width = 6;
+    cfg.chunk_height = 6;
+    cfg.default_step_mode = RG_STEP_MODE_FULL_SCAN_SERIAL;
+    cfg.deterministic_mode = 1u;
+    cfg.deterministic_seed = 11u;
+    ASSERT_STATUS(rg_world_create(&cfg, &world), RG_STATUS_OK);
+    ASSERT_STATUS(rg_chunk_load(world, 0, 0), RG_STATUS_OK);
+
+    memset(&desc, 0, sizeof(desc));
+    desc.name = "swapper";
+    desc.flags = RG_MATERIAL_CUSTOM_UPDATE;
+    desc.update_fn = test_custom_swap_update;
+    desc.user_data = &swap_user;
+    ASSERT_STATUS(rg_material_register(world, &desc, &swapper_id), RG_STATUS_OK);
+
+    ASSERT_TRUE(register_simple_material(world, "neighbor", RG_MATERIAL_SOLID, 1.0f, &neighbor_id) == 0);
+
+    memset(&write, 0, sizeof(write));
+    write.material_id = swapper_id;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){1, 1}, &write), RG_STATUS_OK);
+    write.material_id = neighbor_id;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){2, 1}, &write), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_world_step(world, NULL), RG_STATUS_OK);
+    ASSERT_TRUE(swap_user.call_count == 1u);
+
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){1, 1}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == neighbor_id);
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){2, 1}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == swapper_id);
+
+    rg_world_destroy(world);
+    return 0;
+}
+
+static int test_custom_update_transform_in_checkerboard(void)
+{
+    rg_world_t* world;
+    rg_world_config_t cfg;
+    rg_material_desc_t desc;
+    rg_material_id_t transformer_id;
+    rg_material_id_t target_id;
+    rg_cell_write_t write;
+    rg_cell_read_t read;
+    rg_step_options_t step_options;
+    test_custom_transform_user_t transform_user;
+    test_runner_state_t runner_state;
+    rg_runner_t runner;
+
+    memset(&runner_state, 0, sizeof(runner_state));
+    runner.vtable = &g_test_runner_vtable;
+    runner.user = &runner_state;
+
+    memset(&transform_user, 0, sizeof(transform_user));
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.chunk_width = 4;
+    cfg.chunk_height = 4;
+    cfg.default_step_mode = RG_STEP_MODE_CHUNK_CHECKERBOARD_PARALLEL;
+    cfg.deterministic_mode = 1u;
+    cfg.deterministic_seed = 123u;
+    cfg.runner = &runner;
+    ASSERT_STATUS(rg_world_create(&cfg, &world), RG_STATUS_OK);
+    ASSERT_STATUS(rg_chunk_load(world, 0, 0), RG_STATUS_OK);
+
+    ASSERT_TRUE(register_simple_material(world, "target", RG_MATERIAL_SOLID, 20.0f, &target_id) == 0);
+
+    memset(&desc, 0, sizeof(desc));
+    desc.name = "transformer";
+    desc.flags = RG_MATERIAL_CUSTOM_UPDATE;
+    desc.update_fn = test_custom_transform_update;
+    transform_user.target_material_id = target_id;
+    desc.user_data = &transform_user;
+    ASSERT_STATUS(rg_material_register(world, &desc, &transformer_id), RG_STATUS_OK);
+
+    memset(&write, 0, sizeof(write));
+    write.material_id = transformer_id;
+    ASSERT_STATUS(rg_cell_set(world, (rg_cell_coord_t){1, 1}, &write), RG_STATUS_OK);
+
+    memset(&step_options, 0, sizeof(step_options));
+    step_options.mode = RG_STEP_MODE_CHUNK_CHECKERBOARD_PARALLEL;
+    step_options.substeps = 1u;
+    ASSERT_STATUS(rg_world_step(world, &step_options), RG_STATUS_OK);
+
+    ASSERT_TRUE(transform_user.call_count == 1u);
+    ASSERT_TRUE(runner_state.call_count > 0u);
+    ASSERT_STATUS(rg_cell_get(world, (rg_cell_coord_t){1, 1}, &read), RG_STATUS_OK);
+    ASSERT_TRUE(read.material_id == target_id);
+
+    rg_world_destroy(world);
+    return 0;
+}
+
+static int test_custom_update_random_is_seeded(void)
+{
+    rg_world_t* world_a;
+    rg_world_t* world_b;
+    rg_world_config_t cfg;
+    rg_material_desc_t desc;
+    rg_material_id_t random_id_a;
+    rg_material_id_t random_id_b;
+    rg_cell_write_t write;
+    rg_cell_read_t read_a;
+    rg_cell_read_t read_b;
+    test_custom_random_user_t random_user_a;
+    test_custom_random_user_t random_user_b;
+    test_cell_data_t payload;
+    const test_cell_data_t* out_a;
+    const test_cell_data_t* out_b;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.chunk_width = 4;
+    cfg.chunk_height = 4;
+    cfg.default_step_mode = RG_STEP_MODE_FULL_SCAN_SERIAL;
+    cfg.deterministic_mode = 1u;
+    cfg.deterministic_seed = 9001u;
+
+    memset(&random_user_a, 0, sizeof(random_user_a));
+    memset(&random_user_b, 0, sizeof(random_user_b));
+
+    ASSERT_STATUS(rg_world_create(&cfg, &world_a), RG_STATUS_OK);
+    ASSERT_STATUS(rg_world_create(&cfg, &world_b), RG_STATUS_OK);
+    ASSERT_STATUS(rg_chunk_load(world_a, 0, 0), RG_STATUS_OK);
+    ASSERT_STATUS(rg_chunk_load(world_b, 0, 0), RG_STATUS_OK);
+
+    memset(&desc, 0, sizeof(desc));
+    desc.name = "random_custom";
+    desc.flags = RG_MATERIAL_CUSTOM_UPDATE;
+    desc.instance_size = (uint16_t)sizeof(test_cell_data_t);
+    desc.instance_align = (uint16_t)_Alignof(test_cell_data_t);
+    desc.update_fn = test_custom_random_update;
+    desc.user_data = &random_user_a;
+    ASSERT_STATUS(rg_material_register(world_a, &desc, &random_id_a), RG_STATUS_OK);
+
+    desc.user_data = &random_user_b;
+    ASSERT_STATUS(rg_material_register(world_b, &desc, &random_id_b), RG_STATUS_OK);
+
+    payload.id = 0u;
+    payload.temperature = 0;
+    memset(&write, 0, sizeof(write));
+    write.instance_data = &payload;
+
+    write.material_id = random_id_a;
+    ASSERT_STATUS(rg_cell_set(world_a, (rg_cell_coord_t){2, 2}, &write), RG_STATUS_OK);
+    write.material_id = random_id_b;
+    ASSERT_STATUS(rg_cell_set(world_b, (rg_cell_coord_t){2, 2}, &write), RG_STATUS_OK);
+
+    ASSERT_STATUS(rg_world_step(world_a, NULL), RG_STATUS_OK);
+    ASSERT_STATUS(rg_world_step(world_b, NULL), RG_STATUS_OK);
+    ASSERT_TRUE(random_user_a.call_count == 1u);
+    ASSERT_TRUE(random_user_b.call_count == 1u);
+
+    ASSERT_STATUS(rg_cell_get(world_a, (rg_cell_coord_t){2, 2}, &read_a), RG_STATUS_OK);
+    ASSERT_STATUS(rg_cell_get(world_b, (rg_cell_coord_t){2, 2}, &read_b), RG_STATUS_OK);
+    ASSERT_TRUE(read_a.instance_data != NULL);
+    ASSERT_TRUE(read_b.instance_data != NULL);
+    out_a = (const test_cell_data_t*)read_a.instance_data;
+    out_b = (const test_cell_data_t*)read_b.instance_data;
+    ASSERT_TRUE(out_a->id == out_b->id);
+
+    rg_world_destroy(world_a);
+    rg_world_destroy(world_b);
+    return 0;
+}
+
 int main(void)
 {
     RUN_TEST(test_world_create_defaults);
@@ -660,6 +996,10 @@ int main(void)
     RUN_TEST(test_unloaded_chunk_cell_access);
     RUN_TEST(test_checkerboard_parallel_cross_chunk_with_runner);
     RUN_TEST(test_checkerboard_parallel_conflict_resolution);
+    RUN_TEST(test_custom_update_try_move_with_payload);
+    RUN_TEST(test_custom_update_try_swap);
+    RUN_TEST(test_custom_update_transform_in_checkerboard);
+    RUN_TEST(test_custom_update_random_is_seeded);
 
     printf("regolith tests passed\n");
     return 0;

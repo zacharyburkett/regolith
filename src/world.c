@@ -102,6 +102,22 @@ typedef struct rg_checkerboard_task_ctx_s {
     rg_task_output_t* outputs;
 } rg_checkerboard_task_ctx_t;
 
+struct rg_update_ctx_s {
+    rg_world_t* world;
+    uint64_t tick;
+    uint32_t source_chunk_index;
+    rg_chunk_entry_t* source_entry;
+    int32_t source_local_x;
+    int32_t source_local_y;
+    uint32_t source_cell_index;
+    rg_cell_coord_t source_cell;
+    uint8_t emit_cross_intents;
+    rg_task_output_t* task_output;
+    uint32_t random_counter;
+    uint8_t operation_done;
+    uint8_t changed;
+};
+
 static int rg_is_power_of_two_u32(uint32_t value)
 {
     return value != 0u && (value & (value - 1u)) == 0u;
@@ -115,6 +131,11 @@ static uint64_t rg_mix_u64(uint64_t value)
     value *= 0x94d049bb133111ebull;
     value ^= value >> 31u;
     return value;
+}
+
+static int32_t rg_abs_i32(int32_t value)
+{
+    return (value < 0) ? -value : value;
 }
 
 static void* rg_default_alloc(void* user, size_t size, size_t align)
@@ -353,6 +374,23 @@ static void rg_recompute_active_chunk_count(rg_world_t* world)
     }
 
     world->active_chunk_count = count;
+}
+
+static void rg_set_chunk_awake_for_mode(
+    rg_world_t* world,
+    rg_chunk_t* chunk,
+    uint8_t awake,
+    rg_task_output_t* task_output)
+{
+    if (chunk == NULL) {
+        return;
+    }
+
+    if (task_output != NULL) {
+        chunk->awake = (uint8_t)(awake != 0u);
+    } else {
+        rg_chunk_set_awake(world, chunk, awake);
+    }
 }
 
 static uint8_t rg_mask_test(const rg_chunk_t* chunk, uint32_t cell_index)
@@ -1199,13 +1237,16 @@ static uint8_t rg_attempt_move(
 
     source_chunk->idle_steps = 0u;
     target_chunk->idle_steps = 0u;
-    if (task_output != NULL) {
-        source_chunk->awake = (uint8_t)(source_chunk->live_cells > 0u);
-        target_chunk->awake = (uint8_t)(target_chunk->live_cells > 0u);
-    } else {
-        rg_chunk_set_awake(world, source_chunk, (uint8_t)(source_chunk->live_cells > 0u));
-        rg_chunk_set_awake(world, target_chunk, (uint8_t)(target_chunk->live_cells > 0u));
-    }
+    rg_set_chunk_awake_for_mode(
+        world,
+        source_chunk,
+        (uint8_t)(source_chunk->live_cells > 0u),
+        task_output);
+    rg_set_chunk_awake_for_mode(
+        world,
+        target_chunk,
+        (uint8_t)(target_chunk->live_cells > 0u),
+        task_output);
     rg_mask_set(target_chunk, target_index);
 
     if (task_output != NULL) {
@@ -1560,8 +1601,37 @@ static uint8_t rg_step_chunk_serial(
 
             primary_left = (uint8_t)(rg_step_random(world, tick, entry->chunk_x, entry->chunk_y, x, y, 0xabu) & 1u);
             moved = 0u;
+            if (material->update_fn != NULL) {
+                rg_update_ctx_t update_ctx;
+                void* instance_data;
 
-            if ((material->flags & RG_MATERIAL_GAS) != 0u) {
+                memset(&update_ctx, 0, sizeof(update_ctx));
+                update_ctx.world = world;
+                update_ctx.tick = tick;
+                update_ctx.source_chunk_index = source_chunk_index;
+                update_ctx.source_entry = entry;
+                update_ctx.source_local_x = x;
+                update_ctx.source_local_y = y;
+                update_ctx.source_cell_index = index;
+                update_ctx.source_cell.x = (entry->chunk_x * world->chunk_width) + x;
+                update_ctx.source_cell.y = (entry->chunk_y * world->chunk_height) + y;
+                update_ctx.emit_cross_intents = emit_cross_intents;
+                update_ctx.task_output = task_output;
+
+                instance_data = NULL;
+                if (material->instance_size > 0u) {
+                    instance_data = rg_chunk_payload_ptr(world, chunk, index);
+                }
+
+                material->update_fn(
+                    &update_ctx,
+                    update_ctx.source_cell,
+                    material_id,
+                    instance_data,
+                    material->user_data);
+
+                moved = update_ctx.changed;
+            } else if ((material->flags & RG_MATERIAL_GAS) != 0u) {
                 moved = rg_step_gas(
                     world,
                     source_chunk_index,
@@ -1614,28 +1684,16 @@ static uint8_t rg_step_chunk_serial(
 
     if (chunk->live_cells == 0u) {
         chunk->idle_steps = 0u;
-        if (task_output != NULL) {
-            chunk->awake = 0u;
-        } else {
-            rg_chunk_set_awake(world, chunk, 0u);
-        }
+        rg_set_chunk_awake_for_mode(world, chunk, 0u, task_output);
     } else if (changed != 0u) {
         chunk->idle_steps = 0u;
-        if (task_output != NULL) {
-            chunk->awake = 1u;
-        } else {
-            rg_chunk_set_awake(world, chunk, 1u);
-        }
+        rg_set_chunk_awake_for_mode(world, chunk, 1u, task_output);
     } else {
         if (chunk->idle_steps < UINT32_MAX) {
             chunk->idle_steps += 1u;
         }
         if (chunk->idle_steps >= RG_CHUNK_SLEEP_TICKS) {
-            if (task_output != NULL) {
-                chunk->awake = 0u;
-            } else {
-                rg_chunk_set_awake(world, chunk, 0u);
-            }
+            rg_set_chunk_awake_for_mode(world, chunk, 0u, task_output);
         }
     }
 
@@ -2308,20 +2366,321 @@ rg_status_t rg_world_get_stats(const rg_world_t* world, rg_world_stats_t* out_st
     return RG_STATUS_OK;
 }
 
+static uint8_t rg_cell_coord_equal(rg_cell_coord_t lhs, rg_cell_coord_t rhs)
+{
+    return (uint8_t)(lhs.x == rhs.x && lhs.y == rhs.y);
+}
+
+static rg_status_t rg_ctx_validate(rg_update_ctx_t* ctx)
+{
+    if (ctx == NULL || ctx->world == NULL || ctx->source_entry == NULL) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+    if (ctx->source_chunk_index >= ctx->world->chunk_count) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+    if (ctx->operation_done != 0u) {
+        return RG_STATUS_CONFLICT;
+    }
+    return RG_STATUS_OK;
+}
+
+static rg_status_t rg_ctx_transform_current_cell(
+    rg_update_ctx_t* ctx,
+    rg_material_id_t new_material,
+    const void* new_instance_data)
+{
+    rg_world_t* world;
+    rg_chunk_entry_t* source_entry;
+    rg_chunk_t* source_chunk;
+    rg_material_id_t old_material_id;
+    const rg_material_record_t* old_material;
+    const rg_material_record_t* new_material_record;
+    rg_status_t status;
+
+    if (ctx == NULL || ctx->world == NULL) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    world = ctx->world;
+    source_entry = &world->chunks[ctx->source_chunk_index];
+    source_chunk = source_entry->chunk;
+    if (source_chunk == NULL || ctx->source_cell_index >= world->cells_per_chunk) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    old_material_id = source_chunk->material_ids[ctx->source_cell_index];
+    if (old_material_id == 0u) {
+        return RG_STATUS_NOT_FOUND;
+    }
+
+    old_material = rg_material_get(world, old_material_id);
+    if (old_material == NULL) {
+        return RG_STATUS_NOT_FOUND;
+    }
+
+    if (new_material == 0u) {
+        rg_release_cell_instance(world, source_chunk, ctx->source_cell_index, old_material);
+        source_chunk->material_ids[ctx->source_cell_index] = 0u;
+        rg_update_live_counts(world, source_chunk, old_material_id, 0u);
+        source_chunk->idle_steps = 0u;
+        rg_set_chunk_awake_for_mode(
+            world,
+            source_chunk,
+            (uint8_t)(source_chunk->live_cells > 0u),
+            ctx->task_output);
+        rg_mask_set(source_chunk, ctx->source_cell_index);
+        return RG_STATUS_OK;
+    }
+
+    new_material_record = rg_material_get(world, new_material);
+    if (new_material_record == NULL) {
+        return RG_STATUS_NOT_FOUND;
+    }
+
+    if (new_material != old_material_id) {
+        rg_release_cell_instance(world, source_chunk, ctx->source_cell_index, old_material);
+    } else if (new_instance_data == NULL) {
+        rg_mask_set(source_chunk, ctx->source_cell_index);
+        return RG_STATUS_OK;
+    }
+
+    status = rg_write_cell_instance(
+        world,
+        source_chunk,
+        ctx->source_cell_index,
+        new_material_record,
+        new_instance_data);
+    if (status != RG_STATUS_OK) {
+        return status;
+    }
+
+    source_chunk->material_ids[ctx->source_cell_index] = new_material;
+    rg_update_live_counts(world, source_chunk, old_material_id, new_material);
+    source_chunk->idle_steps = 0u;
+    rg_set_chunk_awake_for_mode(
+        world,
+        source_chunk,
+        (uint8_t)(source_chunk->live_cells > 0u),
+        ctx->task_output);
+    rg_mask_set(source_chunk, ctx->source_cell_index);
+    return RG_STATUS_OK;
+}
+
 rg_status_t rg_ctx_try_move(rg_update_ctx_t* ctx, rg_cell_coord_t from, rg_cell_coord_t to)
 {
-    (void)ctx;
-    (void)from;
-    (void)to;
-    return RG_STATUS_UNSUPPORTED;
+    rg_status_t status;
+    rg_world_t* world;
+    rg_chunk_entry_t* source_entry;
+    rg_chunk_t* source_chunk;
+    rg_material_id_t source_material_id;
+    const rg_material_record_t* source_material;
+    int32_t dx;
+    int32_t dy;
+    uint32_t target_chunk_index;
+    rg_chunk_entry_t* target_entry;
+    uint32_t target_index;
+    int32_t target_local_x;
+    int32_t target_local_y;
+
+    status = rg_ctx_validate(ctx);
+    if (status != RG_STATUS_OK) {
+        return status;
+    }
+    if (rg_cell_coord_equal(from, ctx->source_cell) == 0u) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    dx = to.x - from.x;
+    dy = to.y - from.y;
+    if ((dx == 0 && dy == 0) || rg_abs_i32(dx) > 1 || rg_abs_i32(dy) > 1) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    world = ctx->world;
+    source_entry = &world->chunks[ctx->source_chunk_index];
+    source_chunk = source_entry->chunk;
+    if (source_chunk == NULL || ctx->source_cell_index >= world->cells_per_chunk) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    source_material_id = source_chunk->material_ids[ctx->source_cell_index];
+    if (source_material_id == 0u) {
+        return RG_STATUS_NOT_FOUND;
+    }
+    source_material = rg_material_get(world, source_material_id);
+    if (source_material == NULL) {
+        return RG_STATUS_NOT_FOUND;
+    }
+
+    status = rg_resolve_target(
+        world,
+        source_entry,
+        ctx->source_local_x,
+        ctx->source_local_y,
+        dx,
+        dy,
+        &target_entry,
+        &target_chunk_index,
+        &target_index,
+        &target_local_x,
+        &target_local_y);
+    if (status != RG_STATUS_OK) {
+        return status;
+    }
+    (void)target_entry;
+    (void)target_chunk_index;
+    (void)target_index;
+    (void)target_local_x;
+    (void)target_local_y;
+
+    if (rg_attempt_move(
+            world,
+            ctx->source_chunk_index,
+            source_entry,
+            ctx->source_local_x,
+            ctx->source_local_y,
+            ctx->source_cell_index,
+            source_material_id,
+            source_material,
+            dx,
+            dy,
+            1u,
+            ctx->emit_cross_intents,
+            ctx->task_output) == 0u) {
+        return RG_STATUS_CONFLICT;
+    }
+
+    ctx->operation_done = 1u;
+    ctx->changed = 1u;
+    return RG_STATUS_OK;
 }
 
 rg_status_t rg_ctx_try_swap(rg_update_ctx_t* ctx, rg_cell_coord_t a, rg_cell_coord_t b)
 {
-    (void)ctx;
-    (void)a;
-    (void)b;
-    return RG_STATUS_UNSUPPORTED;
+    rg_status_t status;
+    rg_world_t* world;
+    rg_chunk_entry_t* source_entry;
+    rg_chunk_t* source_chunk;
+    rg_material_id_t source_material_id;
+    rg_chunk_entry_t* target_entry;
+    uint32_t target_chunk_index;
+    uint32_t target_index;
+    int32_t target_local_x;
+    int32_t target_local_y;
+    int32_t dx;
+    int32_t dy;
+    rg_chunk_t* target_chunk;
+    rg_material_id_t target_material_id;
+    const rg_material_record_t* target_material;
+
+    status = rg_ctx_validate(ctx);
+    if (status != RG_STATUS_OK) {
+        return status;
+    }
+    if (rg_cell_coord_equal(a, ctx->source_cell) == 0u) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    dx = b.x - a.x;
+    dy = b.y - a.y;
+    if ((dx == 0 && dy == 0) || rg_abs_i32(dx) > 1 || rg_abs_i32(dy) > 1) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    world = ctx->world;
+    source_entry = &world->chunks[ctx->source_chunk_index];
+    source_chunk = source_entry->chunk;
+    if (source_chunk == NULL || ctx->source_cell_index >= world->cells_per_chunk) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    source_material_id = source_chunk->material_ids[ctx->source_cell_index];
+    if (source_material_id == 0u) {
+        return RG_STATUS_NOT_FOUND;
+    }
+
+    status = rg_resolve_target(
+        world,
+        source_entry,
+        ctx->source_local_x,
+        ctx->source_local_y,
+        dx,
+        dy,
+        &target_entry,
+        &target_chunk_index,
+        &target_index,
+        &target_local_x,
+        &target_local_y);
+    if (status != RG_STATUS_OK) {
+        return status;
+    }
+    (void)target_local_x;
+    (void)target_local_y;
+
+    target_chunk = target_entry->chunk;
+    if (target_chunk == NULL) {
+        return RG_STATUS_NOT_FOUND;
+    }
+    target_material_id = target_chunk->material_ids[target_index];
+    if (target_material_id == 0u) {
+        return RG_STATUS_CONFLICT;
+    }
+
+    target_material = rg_material_get(world, target_material_id);
+    if (target_material == NULL) {
+        return RG_STATUS_NOT_FOUND;
+    }
+    if ((target_material->flags & RG_MATERIAL_STATIC) != 0u) {
+        return RG_STATUS_CONFLICT;
+    }
+
+    if (ctx->emit_cross_intents != 0u && target_chunk_index != ctx->source_chunk_index) {
+        rg_cross_intent_t intent;
+
+        if (ctx->task_output == NULL) {
+            return RG_STATUS_INVALID_ARGUMENT;
+        }
+
+        intent.source_chunk_index = ctx->source_chunk_index;
+        intent.target_chunk_index = target_chunk_index;
+        intent.source_cell_index = ctx->source_cell_index;
+        intent.target_cell_index = target_index;
+        intent.source_material_id = source_material_id;
+        intent.target_material_id = target_material_id;
+        if (rg_task_output_push_intent(ctx->task_output, &intent) == 0u) {
+            return RG_STATUS_ALLOCATION_FAILED;
+        }
+        ctx->task_output->emitted_move_count += 1u;
+    } else {
+        target_chunk->material_ids[target_index] = source_material_id;
+        source_chunk->material_ids[ctx->source_cell_index] = target_material_id;
+        rg_payload_swap(world, source_chunk, ctx->source_cell_index, target_chunk, target_index);
+
+        source_chunk->idle_steps = 0u;
+        target_chunk->idle_steps = 0u;
+        rg_set_chunk_awake_for_mode(
+            world,
+            source_chunk,
+            (uint8_t)(source_chunk->live_cells > 0u),
+            ctx->task_output);
+        rg_set_chunk_awake_for_mode(
+            world,
+            target_chunk,
+            (uint8_t)(target_chunk->live_cells > 0u),
+            ctx->task_output);
+        rg_mask_set(target_chunk, target_index);
+
+        if (ctx->task_output != NULL) {
+            ctx->task_output->emitted_move_count += 1u;
+        } else {
+            world->intents_emitted_last_step += 1u;
+        }
+    }
+
+    ctx->operation_done = 1u;
+    ctx->changed = 1u;
+    return RG_STATUS_OK;
 }
 
 rg_status_t rg_ctx_transform(
@@ -2330,15 +2689,42 @@ rg_status_t rg_ctx_transform(
     rg_material_id_t new_material,
     const void* new_instance_data)
 {
-    (void)ctx;
-    (void)cell;
-    (void)new_material;
-    (void)new_instance_data;
-    return RG_STATUS_UNSUPPORTED;
+    rg_status_t status;
+
+    status = rg_ctx_validate(ctx);
+    if (status != RG_STATUS_OK) {
+        return status;
+    }
+    if (rg_cell_coord_equal(cell, ctx->source_cell) == 0u) {
+        return RG_STATUS_INVALID_ARGUMENT;
+    }
+
+    status = rg_ctx_transform_current_cell(ctx, new_material, new_instance_data);
+    if (status != RG_STATUS_OK) {
+        return status;
+    }
+
+    ctx->operation_done = 1u;
+    ctx->changed = 1u;
+    return RG_STATUS_OK;
 }
 
 uint32_t rg_ctx_random_u32(rg_update_ctx_t* ctx)
 {
-    (void)ctx;
-    return 0u;
+    uint32_t salt;
+
+    if (ctx == NULL || ctx->world == NULL || ctx->source_entry == NULL) {
+        return 0u;
+    }
+
+    salt = 0xC001u + ctx->random_counter;
+    ctx->random_counter += 1u;
+    return rg_step_random(
+        ctx->world,
+        ctx->tick,
+        ctx->source_entry->chunk_x,
+        ctx->source_entry->chunk_y,
+        ctx->source_local_x,
+        ctx->source_local_y,
+        salt);
 }
